@@ -30,11 +30,31 @@ except ImportError:
 
 console = Console()
 
-# Version
-
 __version__ = "0.1.0"
 
-# Helpers
+
+def _check_for_updates() -> None:
+    """Check PyPI for a newer version. Non-blocking, silent on failure."""
+    import json
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            "https://pypi.org/pypi/verra-one/json",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read())
+        latest = data.get("info", {}).get("version", "")
+        if latest and latest != __version__:
+            console.print(
+                f"  [yellow]Update available:[/yellow] {__version__} → {latest}"
+            )
+            console.print(
+                f"  [dim]Run: pip install --upgrade verra-one[/dim]\n"
+            )
+    except Exception:
+        pass  # offline, PyPI down, not published yet — all fine
 
 
 def _apply_api_key_from_config() -> None:
@@ -414,7 +434,8 @@ def _repl_search(query: str, metadata_store: Any, vector_store: Any) -> None:
 @click.version_option(version=__version__, prog_name="verra")
 @click.pass_context
 def main(ctx: click.Context) -> None:
-    """Verra One -- Your business data, one conversation away."""
+    """Verra One -- chat with your business data."""
+    _check_for_updates()
     if ctx.invoked_subcommand is None:
         from verra.config import VERRA_HOME
 
