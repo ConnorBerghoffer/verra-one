@@ -11,6 +11,7 @@ os.environ.setdefault("LITELLM_LOG", "ERROR")
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -252,6 +253,9 @@ def _run_chat_repl(model_override: str | None = None) -> None:
         multiline=True,
     )
 
+    # Track last retrieval results so /sources can display them
+    _last_results: list[Any] = []
+
     try:
         while True:
             try:
@@ -286,6 +290,7 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                 elif cmd == "/new":
                     engine.conversation_id = engine.memory_store.new_conversation()
                     engine._history.clear()
+                    _last_results.clear()
                     console.print("[dim]New conversation started.[/dim]\n")
                     continue
                 elif cmd == "/model":
@@ -293,6 +298,9 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                     continue
                 elif cmd == "/briefing":
                     _show_briefing(db)
+                    continue
+                elif cmd == "/sources":
+                    _repl_show_sources(_last_results)
                     continue
                 elif cmd.startswith("/search"):
                     search_query = user_input[len("/search"):].strip()
@@ -305,10 +313,52 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                     console.print(f"[yellow]Unknown command: {cmd}[/yellow] — type /help\n")
                     continue
 
-            # Stream the response
+            # --- Two-phase streaming response ---
             console.print()
+            t_start = time.time()
             try:
+                # Phase 1: retrieval with animated spinner status line
+                _spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                _spin_idx = [0]
+
+                def _search_render() -> Text:
+                    dot = _spinner_chars[_spin_idx[0] % len(_spinner_chars)]
+                    _spin_idx[0] += 1
+                    return Text.assemble(("  " + dot + "  searching...", "dim"))
+
+                with Live(
+                    _search_render(),
+                    console=console,
+                    refresh_per_second=10,
+                    transient=True,
+                ) as live_search:
+                    live_search.update(_search_render())
+                    t_retrieval_start = time.time()
+                    results, _classified = engine.retrieve(user_input)
+                    t_retrieval = time.time() - t_retrieval_start
+
+                # Store results for /sources command
+                _last_results.clear()
+                _last_results.extend(results)
+
+                # Build deduped source name list
+                _source_seen: set[str] = set()
+                unique_sources: list[str] = []
+                for r in results:
+                    name = r.metadata.get("file_name", "")
+                    if name and name not in _source_seen:
+                        unique_sources.append(name)
+                        _source_seen.add(name)
+
+                console.print(
+                    f"  [dim]searched  "
+                    f"{len(results)} results \u00b7 {len(unique_sources)} files \u00b7 "
+                    f"{t_retrieval:.1f}s[/dim]"
+                )
+
+                # Phase 2: streaming LLM response with live panel
                 full_response: list[str] = []
+
                 with Live(
                     Panel(
                         Text("...", style="dim"),
@@ -318,20 +368,33 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                     console=console,
                     refresh_per_second=12,
                     vertical_overflow="visible",
-                ) as live:
-                    for chunk in engine.stream_ask(user_input):
+                ) as live_gen:
+                    for chunk in engine.stream_with_context(user_input, results):
                         full_response.append(chunk)
                         accumulated = "".join(full_response)
                         try:
                             content = Markdown(accumulated)
                         except Exception:
                             content = Text(accumulated)
-                        live.update(Panel(
+                        live_gen.update(Panel(
                             content,
                             border_style="cyan",
                             padding=(0, 1),
                         ))
 
+                elapsed = time.time() - t_start
+
+                # Source footer below the response panel
+                if unique_sources:
+                    sources_str = " \u00b7 ".join(unique_sources[:5])
+                    if len(unique_sources) > 5:
+                        sources_str += f" \u00b7 +{len(unique_sources) - 5} more"
+                    console.print(f"  [dim]{sources_str}[/dim]")
+                console.print(
+                    f"  [dim]{len(results)} chunks \u00b7 "
+                    f"{len(unique_sources)} sources \u00b7 "
+                    f"{elapsed:.1f}s[/dim]"
+                )
                 console.print()
 
             except RuntimeError as exc:
@@ -363,6 +426,7 @@ def _print_help() -> None:
     console.print()
     left = (
         "[cyan]/search[/cyan] [dim]<query>[/dim]  search without LLM\n"
+        "[cyan]/sources[/cyan]         sources from last answer\n"
         "[cyan]/briefing[/cyan]        actionable insights\n"
         "[cyan]/status[/cyan]          ingestion stats\n"
         "[cyan]/model[/cyan]           current model"
@@ -486,6 +550,34 @@ def _repl_search(query: str, metadata_store: Any, vector_store: Any) -> None:
     console.print()
 
 
+def _repl_show_sources(results: list[Any]) -> None:
+    """Display the source files from the last retrieval in the REPL."""
+    if not results:
+        console.print("  [dim]No sources yet — ask a question first.[/dim]\n")
+        return
+
+    seen: set[str] = set()
+    sources: list[tuple[str, str, float]] = []
+    for r in results:
+        name = r.metadata.get("file_name", "")
+        path = r.metadata.get("file_path", "")
+        score = r.score
+        label = name or path or r.metadata.get("source_type", "unknown")
+        if label not in seen:
+            seen.add(label)
+            sources.append((label, path, score))
+
+    console.print()
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("File")
+    table.add_column("Score", justify="right", style="dim")
+
+    for i, (label, _path, score) in enumerate(sources, 1):
+        table.add_row(str(i), label, f"{score:.2f}")
+
+    console.print(table)
+    console.print()
 
 
 @click.group(invoke_without_command=True)
@@ -953,6 +1045,38 @@ def info() -> None:
     ctx.invoke(status)
 
 
+@main.command()
+def update() -> None:
+    """Update Verra One to the latest version."""
+    import subprocess
+
+    console.print()
+    console.print("  Checking for updates...")
+    try:
+        result = subprocess.run(
+            ["pipx", "upgrade", "verra-one"], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            msg = result.stdout.strip() or result.stderr.strip()
+            console.print(f"  [green]{msg}[/green]")
+        else:
+            # pipx failed or not installed — fall back to pip
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-U", "verra-one"],
+                capture_output=True,
+                text=True,
+            )
+            msg = result.stdout.strip() or result.stderr.strip()
+            console.print(f"  {msg}")
+    except FileNotFoundError:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "verra-one"],
+            capture_output=True,
+            text=True,
+        )
+        msg = result.stdout.strip() or result.stderr.strip()
+        console.print(f"  {msg}")
+    console.print()
 
 
 @main.command()
@@ -1722,8 +1846,24 @@ def sync() -> None:
 
 
 @sync.command(name="start")
-def sync_start() -> None:
-    """Start the background sync daemon (runs until Ctrl+C)."""
+@click.option(
+    "--background",
+    "--daemon",
+    "background",
+    is_flag=True,
+    default=False,
+    help="Fork into the background and write a PID file to ~/.verra/sync.pid.",
+)
+def sync_start(background: bool) -> None:
+    """Start the background sync daemon (runs until Ctrl+C).
+
+    Pass --background (or --daemon) to detach from the terminal immediately.
+    The child process writes its PID to ~/.verra/sync.pid so that
+    'verra sync stop' can send SIGTERM to it later.
+    """
+    import os
+    import sys
+
     from verra.config import VERRA_HOME, ensure_data_dir, load_config
     from verra.store.db import DatabaseManager
     from verra.store.metadata import MetadataStore
@@ -1744,6 +1884,45 @@ def sync_start() -> None:
         )
         return
 
+    pid_file = VERRA_HOME / "sync.pid"
+
+    if background:
+        # -----------------------------------------------------------------
+        # Fork-based daemonisation — POSIX only.
+        # On Windows, fall back to subprocess.Popen with a detached process.
+        # -----------------------------------------------------------------
+        if hasattr(os, "fork"):
+            pid = os.fork()
+            if pid > 0:
+                # Parent: record the child PID and exit.
+                pid_file.write_text(str(pid))
+                console.print(f"\n  [bold cyan]Sync daemon started (PID {pid})[/bold cyan]")
+                console.print(f"  [dim]PID file: {pid_file}[/dim]")
+                console.print(f"  [dim]Stop with: verra sync stop[/dim]\n")
+                sys.exit(0)
+            # Child: detach from the controlling terminal.
+            os.setsid()
+        else:
+            # Windows fallback — spawn a new detached process.
+            import subprocess
+
+            cmd = [sys.executable, "-m", "verra.cli", "sync", "start"]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0),
+            )
+            pid_file.write_text(str(proc.pid))
+            console.print(f"\n  [bold cyan]Sync daemon started (PID {proc.pid})[/bold cyan]")
+            console.print(f"  [dim]PID file: {pid_file}[/dim]")
+            console.print(f"  [dim]Stop with: verra sync stop[/dim]\n")
+            return
+
+    # ------------------------------------------------------------------
+    # Foreground (or child process after fork) — run until interrupted.
+    # ------------------------------------------------------------------
     db = DatabaseManager(VERRA_HOME)
     metadata_store = MetadataStore.from_connection(db.core)
     vector_store = VectorStore(VERRA_HOME / "chroma")
@@ -1755,11 +1934,13 @@ def sync_start() -> None:
     )
 
     source_summary = ", ".join(s.path or s.account or "?" for s in config.sources)
-    console.print()
-    console.print(f"  [bold cyan]Verra Sync Daemon[/bold cyan]")
-    console.print(f"  [dim]Sources: {source_summary}[/dim]")
-    console.print(f"  [dim]Interval: {config.sync.interval}s — Ctrl+C to stop[/dim]")
-    console.print()
+    if not background:
+        # Only print the banner in foreground mode; the background child is silent.
+        console.print()
+        console.print("  [bold cyan]Verra Sync Daemon[/bold cyan]")
+        console.print(f"  [dim]Sources: {source_summary}[/dim]")
+        console.print(f"  [dim]Interval: {config.sync.interval}s — Ctrl+C to stop[/dim]")
+        console.print()
 
     daemon.start()
     try:
@@ -1768,10 +1949,54 @@ def sync_start() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        console.print("\n  [dim]Stopping daemon...[/dim]")
+        if not background:
+            console.print("\n  [dim]Stopping daemon...[/dim]")
         daemon.stop()
         db.close()
-        console.print("  [green]Daemon stopped.[/green]\n")
+        # Clean up PID file written by a background child
+        if background and pid_file.exists():
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
+        if not background:
+            console.print("  [green]Daemon stopped.[/green]\n")
+
+
+@sync.command(name="stop")
+def sync_stop() -> None:
+    """Stop a background sync daemon that was started with --background.
+
+    Reads ~/.verra/sync.pid and sends SIGTERM to the recorded process.
+    """
+    import os
+    import signal
+
+    from verra.config import VERRA_HOME
+
+    pid_file = VERRA_HOME / "sync.pid"
+
+    if not pid_file.exists():
+        console.print("\n  [yellow]No PID file found — is the daemon running?[/yellow]\n")
+        return
+
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError) as exc:
+        console.print(f"\n  [red]Could not read PID file: {exc}[/red]\n")
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        pid_file.unlink(missing_ok=True)
+        console.print(f"\n  [green]Sent SIGTERM to PID {pid}.[/green]\n")
+    except ProcessLookupError:
+        console.print(
+            f"\n  [yellow]Process {pid} not found — removing stale PID file.[/yellow]\n"
+        )
+        pid_file.unlink(missing_ok=True)
+    except PermissionError:
+        console.print(f"\n  [red]Permission denied sending signal to PID {pid}.[/red]\n")
 
 
 @sync.command(name="status")
@@ -2165,6 +2390,13 @@ def outlook(
     ensure_data_dir()
     config = load_config()
 
+    # Look up saved client_id from config if not provided on the command line
+    if not client_id:
+        for src in config.sources:
+            if src.type == "outlook" and src.account == account and src.client_id:
+                client_id = src.client_id
+                break
+
     console.print()
     console.print(f"  [bold cyan]Outlook Ingest[/bold cyan]  {account}")
     console.print(f"  [dim]folder={folder}, since={since or 'all time'}[/dim]")
@@ -2179,7 +2411,6 @@ def outlook(
         return
 
     if not authenticated:
-        console.print("  [red]Authentication failed.[/red] Check your client_id and try again.")
         return
 
     console.print("  [green]Authenticated.[/green] Fetching emails...")
@@ -2214,11 +2445,20 @@ def outlook(
             for err in stats.errors[:10]:
                 console.print(f"    [dim]{err}[/dim]")
 
-        existing = {s.account for s in config.sources if s.type == "outlook"}
-        if account not in existing:
-            config.sources.append(SourceConfig(type="outlook", account=account))
+        # Save source to config, storing client_id so it doesn't need to be re-entered
+        existing_sources = [s for s in config.sources if s.type == "outlook" and s.account == account]
+        if not existing_sources:
+            config.sources.append(SourceConfig(type="outlook", account=account, client_id=client_id))
             save_config(config)
             console.print(f"\n  [green]Source saved to config.[/green]")
+        elif client_id:
+            # Update client_id on the existing source if it changed or was newly provided
+            for src in existing_sources:
+                if src.client_id != client_id:
+                    src.client_id = client_id
+                    save_config(config)
+                    console.print(f"\n  [green]Client ID saved to config.[/green]")
+                    break
     finally:
         db.close()
     console.print()

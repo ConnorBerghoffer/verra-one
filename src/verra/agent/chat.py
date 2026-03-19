@@ -223,12 +223,11 @@ class ChatEngine:
 
         return self._ask_single_pass(user_message, classified, _emit)
 
-    def stream_ask(self, user_message: str) -> Iterator[str]:
-        """Stream the answer token by token.
+    def retrieve(self, user_message: str) -> tuple[list[SearchResult], Any]:
+        """Run retrieval only, return results and classified query.
 
-        Yields each text chunk as it arrives from the LLM.
-        Note: sources are NOT yielded; call ask() if you need them.
-        Multi-hop is not supported in streaming mode; uses single-pass.
+        Call this first to get search results, then pass results to
+        stream_with_context() for token-by-token LLM streaming.
         """
         classified = parse_query(user_message)
         results = search(
@@ -238,11 +237,21 @@ class ChatEngine:
             n_results=self.n_results + 4,
             entity_store=self.entity_store,
         )
+        return results, classified
 
+    def stream_with_context(
+        self, user_message: str, results: list[SearchResult]
+    ) -> Iterator[str]:
+        """Stream LLM response given pre-fetched retrieval results.
+
+        Persists the conversation after streaming completes.
+        Yields each text chunk as it arrives from the LLM.
+        """
         best_score = max((r.score for r in results), default=0.0)
         if not results or best_score < _MIN_SCORE:
             yield _NO_ANSWER
             self._persist(user_message, _NO_ANSWER)
+            self._set_conversation_title(user_message)
             return
 
         context_blocks = _format_context(results)
@@ -261,6 +270,18 @@ class ChatEngine:
         answer = "".join(full_answer)
         self._persist(user_message, answer)
         self._update_history(user_message, answer)
+        self._set_conversation_title(user_message)
+
+    def stream_ask(self, user_message: str) -> Iterator[str]:
+        """Stream the answer token by token.
+
+        Yields each text chunk as it arrives from the LLM.
+        Note: sources are NOT yielded; call ask() if you need them.
+        Multi-hop is not supported in streaming mode; uses single-pass.
+        Prefer retrieve() + stream_with_context() for richer status UX.
+        """
+        results, _classified = self.retrieve(user_message)
+        yield from self.stream_with_context(user_message, results)
 
     # ------------------------------------------------------------------
     # Multi-hop retrieval path
@@ -352,6 +373,7 @@ class ChatEngine:
 
         self._persist(user_message, answer)
         self._update_history(user_message, answer)
+        self._set_conversation_title(user_message)
 
         return ChatResponse(
             answer=answer,
@@ -398,6 +420,7 @@ class ChatEngine:
         if not assessment.has_relevant_data:
             no_answer = assessment.confidence_note or _NO_ANSWER
             self._persist(user_message, no_answer)
+            self._set_conversation_title(user_message)
             emit("llm_done", {"tokens_approx": 0, "skipped": True})
             return ChatResponse(
                 answer=no_answer,
@@ -442,6 +465,7 @@ class ChatEngine:
 
         self._persist(user_message, answer)
         self._update_history(user_message, answer)
+        self._set_conversation_title(user_message)
 
         return ChatResponse(
             answer=answer,
@@ -459,6 +483,26 @@ class ChatEngine:
     def _persist(self, user_message: str, answer: str) -> None:
         self.memory_store.add_message(self.conversation_id, "user", user_message)
         self.memory_store.add_message(self.conversation_id, "assistant", answer)
+
+    def _set_conversation_title(self, user_message: str) -> None:
+        """Set conversation title from the first user message if not already set."""
+        try:
+            row = self.memory_store._conn.execute(
+                "SELECT title FROM conversations WHERE id = ?",
+                (self.conversation_id,),
+            ).fetchone()
+            if row and not row[0]:
+                # Truncate to ~60 chars, trim at a word boundary
+                title = user_message.strip()
+                if len(title) > 60:
+                    title = title[:57].rsplit(" ", 1)[0] + "..."
+                self.memory_store._conn.execute(
+                    "UPDATE conversations SET title = ? WHERE id = ?",
+                    (title, self.conversation_id),
+                )
+                self.memory_store._conn.commit()
+        except Exception:
+            pass  # non-critical — never crash the chat loop
 
     def _update_history(self, user_message: str, answer: str) -> None:
         self._history.append({"role": "user", "content": user_message})
