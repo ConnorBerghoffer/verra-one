@@ -53,7 +53,7 @@ class LLMClient:
     def __init__(
         self,
         model: str = "ollama/llama3.2",
-        temperature: float = 0.1,
+        temperature: float = 0.0,
         max_tokens: int = 4096,
         **kwargs: Any,
     ) -> None:
