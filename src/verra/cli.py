@@ -225,12 +225,21 @@ def _run_chat_repl(model_override: str | None = None) -> None:
     except Exception:
         pass
 
+    tabular_store = None
+    try:
+        from verra.store.tabular import TabularStore
+
+        tabular_store = TabularStore(VERRA_HOME / "tabular.db")
+    except Exception:
+        pass
+
     engine = ChatEngine(
         llm=llm,
         metadata_store=metadata_store,
         vector_store=vector_store,
         memory_store=memory_store,
         entity_store=entity_store,
+        tabular_store=tabular_store,
     )
 
     _print_banner(effective_model)
@@ -1198,6 +1207,41 @@ def info() -> None:
     ctx.invoke(status)
 
 
+
+@main.command(name="mcp")
+def mcp_server() -> None:
+    """Start the MCP server (stdio) for use with Claude Desktop and other AI clients."""
+    from verra.mcp_server import run_stdio_server
+
+    run_stdio_server()
+
+
+@main.command(name="mcp-config")
+def mcp_config() -> None:
+    """Print the Claude Desktop MCP configuration for Verra One."""
+    import json
+    import shutil
+
+    verra_path = shutil.which("verra") or "verra"
+    config = {
+        "mcpServers": {
+            "verra-one": {
+                "command": verra_path,
+                "args": ["mcp"],
+            }
+        }
+    }
+    console.print()
+    console.print("  [bold cyan]Claude Desktop MCP Configuration[/bold cyan]")
+    console.print()
+    console.print("  Add this to your Claude Desktop config:")
+    console.print(
+        "  [dim](~/Library/Application Support/Claude/claude_desktop_config.json)[/dim]"
+    )
+    console.print()
+    console.print(json.dumps(config, indent=2))
+    console.print()
+
 @main.command(name="docs")
 @click.option("--limit", default=30, show_default=True, help="Max documents to show.")
 @click.option("--format-filter", "fmt", default=None, help="Filter by format: pdf, txt, csv")
@@ -1331,6 +1375,14 @@ def ingest(folder_path: Path, force: bool, mode: str, dry_run: bool) -> None:
     entity_store = EntityStore.from_connection(db.core)
     analysis_store = AnalysisStore.from_connection(db.analysis)
     vector_store = VectorStore(VERRA_HOME / "chroma")
+
+    tabular_store = None
+    try:
+        from verra.store.tabular import TabularStore
+
+        tabular_store = TabularStore(VERRA_HOME / "tabular.db")
+    except Exception:
+        pass
 
     # -- live state for the renderer --
     _live_state: dict[str, Any] = {
@@ -1470,6 +1522,7 @@ def ingest(folder_path: Path, force: bool, mode: str, dry_run: bool) -> None:
             vector_store=vector_store,
             entity_store=entity_store,
             analysis_store=analysis_store,
+            tabular_store=tabular_store,
             analysis_mode=mode,
             force_reindex=force,
             progress_callback=on_progress,
@@ -1858,6 +1911,7 @@ def clear() -> None:
         VERRA_HOME / "chroma",
         VERRA_HOME / "core.db",
         VERRA_HOME / "analysis.db",
+        VERRA_HOME / "tabular.db",
         VERRA_HOME / "sqlite",
     ]
 
@@ -1985,6 +2039,14 @@ def sources_add(path: Path) -> None:
     analysis_store = AnalysisStore.from_connection(db.analysis)
     vector_store = VectorStore(VERRA_HOME / "chroma")
 
+    sa_tabular_store = None
+    try:
+        from verra.store.tabular import TabularStore as _TabularStore
+
+        sa_tabular_store = _TabularStore(VERRA_HOME / "tabular.db")
+    except Exception:
+        pass
+
     with console.status("  [dim]Processing documents...[/dim]"):
         stats = ingest_folder(
             folder_path=path,
@@ -1992,6 +2054,7 @@ def sources_add(path: Path) -> None:
             vector_store=vector_store,
             entity_store=entity_store,
             analysis_store=analysis_store,
+            tabular_store=sa_tabular_store,
         )
 
     console.print(
@@ -2749,3 +2812,21 @@ def delete(doc_id: int | None, source: str | None, path_pattern: str | None) -> 
             console.print("    verra delete --path-pattern acme -- delete by path match\n")
     finally:
         db.close()
+
+
+@main.command(name="eval")
+@click.option("--category", default=None, help="Only run cases in this category.")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Output results as JSON.")
+def eval_cmd(category: str | None, output_json: bool) -> None:
+    """Run the automated evaluation suite against ingested data."""
+    import os
+
+    os.environ.setdefault("LITELLM_LOG", "ERROR")
+    _apply_api_key_from_config()
+
+    from verra.eval import run_eval
+
+    results = run_eval(category_filter=category, output_json=output_json)
+    failures = sum(1 for r in results if not r["passed"])
+    if failures:
+        raise SystemExit(1)
