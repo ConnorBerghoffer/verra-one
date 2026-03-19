@@ -44,6 +44,19 @@ class IngestStats:
     elapsed_seconds: float = 0.0
 
 
+@dataclass
+class IngestPhase:
+    """Describes the current phase of ingestion for a single file."""
+    file_path: Path | None = None
+    files_done: int = 0
+    files_total: int = 0
+    phase: str = ""            # 'scan', 'extract', 'chunk', 'dedup', 'embed', 'entities', 'analyse', 'done'
+    detail: str = ""           # e.g. '14 chunks' or 'NER'
+    chunks_so_far: int = 0
+    entities_so_far: int = 0
+    errors_so_far: int = 0
+
+
 def ingest_folder(
     folder_path: Path,
     metadata_store: MetadataStore,
@@ -53,6 +66,7 @@ def ingest_folder(
     analysis_mode: str = "realtime",  # 'fast', 'realtime', 'deep'
     force_reindex: bool = False,
     progress_callback: Callable[[Path, int, int], None] | None = None,
+    phase_callback: Callable[[IngestPhase], None] | None = None,
 ) -> IngestStats:
     """Ingest all supported documents from a local folder.
 
@@ -81,28 +95,48 @@ def ingest_folder(
     stats = IngestStats()
     t0 = time.monotonic()
 
-    # Batch-embedding buffer: accumulate chunks across files and flush to
-    # ChromaDB in batches for better ONNX throughput.
+    # Batch-embedding buffer: accumulate (chunk_id, chunk) pairs across files
+    # and flush to ChromaDB in batches of EMBED_BATCH_SIZE.
     EMBED_BATCH_SIZE = 100
     _embed_buffer_ids: list[Any] = []
     _embed_buffer_chunks: list[Any] = []
 
+    def _emit(fp: Path | None, phase: str, detail: str = "") -> None:
+        if phase_callback is not None:
+            phase_callback(IngestPhase(
+                file_path=fp,
+                files_done=stats.files_processed + stats.files_skipped,
+                files_total=files_total,
+                phase=phase,
+                detail=detail,
+                chunks_so_far=stats.chunks_created,
+                entities_so_far=stats.entities_found,
+                errors_so_far=len(stats.errors),
+            ))
+
     def _flush_embed_buffer() -> None:
+        """Flush accumulated chunks to the vector store in one call."""
         if not _embed_buffer_ids:
             return
+        n = len(_embed_buffer_ids)
+        _emit(None, "embed", f"{n} vectors (batch flush)")
         vector_store.add_chunks(_embed_buffer_ids, _embed_buffer_chunks)
         _embed_buffer_ids.clear()
         _embed_buffer_chunks.clear()
 
     # Collect the full list of candidate files up-front so we can report a
     # meaningful ``files_total`` to the progress callback.
+    _emit(None, "scan", "crawling folder")
     all_files = list(crawl_folder(folder_path))
     files_total = len(all_files)
+    _emit(None, "scan", f"found {files_total} files")
 
     for file_path, doc in all_files:
         stats.files_found += 1
 
         try:
+            _emit(file_path, "hash", "checking duplicates")
+
             # Deduplication: compute a simple content hash
             content_hash = _hash_content(doc.content)
 
@@ -110,7 +144,10 @@ def ingest_folder(
                 existing = metadata_store.get_document_by_hash(content_hash)
                 if existing is not None:
                     stats.files_skipped += 1
+                    _emit(file_path, "skip", "unchanged")
                     continue
+
+            _emit(file_path, "extract", f"{len(doc.content):,} chars")
 
             # Classify the document for authority weighting
             doc_type, authority_weight = classify_document_authority(
@@ -144,6 +181,8 @@ def ingest_folder(
             doc_date = extract_document_date(doc.content, str(file_path))
             resolved_content = resolve_time_references(doc.content, doc_date)
 
+            _emit(file_path, "chunk", "splitting")
+
             # Chunk and index — chunks inherit the document authority weight
             chunks = chunk_document(
                 resolved_content,
@@ -158,21 +197,27 @@ def ingest_folder(
                 },
             )
 
+            _emit(file_path, "chunk", f"{len(chunks)} chunks")
+
             # Near-duplicate detection: compare new chunks against existing
             # stored chunk texts before embedding.
-            # Skip when corpus is large — the O(n*m) cost becomes a bottleneck.
+            # Skip dedup when there are too many existing chunks (O(n*m) cost).
             existing_chunk_texts = metadata_store.get_all_chunk_texts()
             dup_pairs: list[tuple[int, int, float]] = []
             if existing_chunk_texts and len(existing_chunk_texts) < 10000:
+                _emit(file_path, "dedup", f"vs {len(existing_chunk_texts)} existing")
                 dup_pairs = find_near_duplicates(chunks, existing_chunk_texts)
                 for new_idx, existing_id, score in dup_pairs:
+                    # Tag the chunk metadata so retrieval can de-rank duplicates.
                     chunks[new_idx].metadata["near_duplicate_of"] = existing_id
                     chunks[new_idx].metadata["near_duplicate_score"] = round(score, 4)
                     stats.near_duplicates_found += 1
+            elif existing_chunk_texts:
+                _emit(file_path, "dedup", f"skipped ({len(existing_chunk_texts)} chunks, too large)")
 
             chunk_ids = metadata_store.add_chunks(doc_id, chunks, authority_weight=authority_weight)
 
-            # Persist near-duplicate relationships (reuse already-computed pairs).
+            # Persist near-duplicate relationships (reuse the pairs we already computed).
             for new_idx, existing_id, score in dup_pairs:
                 metadata_store.add_near_duplicate(
                     chunk_id=chunk_ids[new_idx],
@@ -181,6 +226,7 @@ def ingest_folder(
                 )
 
             # Reference extraction: detect cross-document mentions.
+            _emit(file_path, "refs", "cross-references")
             for chunk, chunk_id in zip(chunks, chunk_ids):
                 refs = extract_references(chunk.text)
                 if refs:
@@ -197,7 +243,7 @@ def ingest_folder(
                             confidence=res.get("confidence", 0.5),
                         )
 
-            # Accumulate into embedding buffer; flush when batch is full.
+            # Accumulate into the embedding buffer; flush when the batch is full.
             _embed_buffer_ids.extend(chunk_ids)
             _embed_buffer_chunks.extend(chunks)
             if len(_embed_buffer_ids) >= EMBED_BATCH_SIZE:
@@ -205,6 +251,7 @@ def ingest_folder(
 
             # Entity extraction (if entity store provided)
             if entity_store is not None:
+                _emit(file_path, "entities", "NER")
                 for chunk, chunk_id in zip(chunks, chunk_ids):
                     extracted = extract_entities(chunk.text)
                     if extracted:
@@ -220,6 +267,7 @@ def ingest_folder(
 
             # Chunk analysis (if analysis store provided)
             if analysis_store is not None:
+                _emit(file_path, "analyse", f"{analysis_mode}")
                 for chunk, chunk_id in zip(chunks, chunk_ids):
                     if analysis_mode == "fast":
                         # Just mark as pending for later deep analysis
@@ -244,16 +292,18 @@ def ingest_folder(
 
             stats.files_processed += 1
             stats.chunks_created += len(chunks)
+            _emit(file_path, "done", f"{len(chunks)} chunks, {stats.entities_found} entities total")
 
         except Exception as exc:
             stats.errors.append(f"{file_path}: {exc}")
             stats.files_skipped += 1
+            _emit(file_path, "error", str(exc)[:80])
 
         finally:
             if progress_callback is not None:
                 progress_callback(file_path, stats.files_processed, files_total)
 
-    # Flush any remaining chunks that didn't fill a complete batch.
+    # Flush any remaining chunks that did not fill a complete batch.
     _flush_embed_buffer()
 
     # Compute quality metrics across the whole batch if any files were processed.
