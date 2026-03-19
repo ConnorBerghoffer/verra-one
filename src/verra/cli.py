@@ -31,7 +31,7 @@ except ImportError:
 
 console = Console()
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 
 def _check_for_updates() -> None:
