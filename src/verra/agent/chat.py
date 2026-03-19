@@ -302,7 +302,7 @@ class ChatEngine:
                 self.vector_store,
                 n_results=self.n_results + 4,
                 entity_store=self.entity_store,
-                llm_client=self.llm,
+                llm_client=None,
             )
             for r in sub_results:
                 if r.chunk_id not in seen_ids:
@@ -327,7 +327,7 @@ class ChatEngine:
                 self.vector_store,
                 n_results=self.n_results + 4,
                 entity_store=self.entity_store,
-                llm_client=self.llm,
+                llm_client=None,
             )
             # Merge: deduplicate by chunk_id, prefer results2 for new chunks
             seen = {r.chunk_id for r in results}
@@ -676,80 +676,83 @@ class ChatEngine:
     })
 
     def _decompose_query(self, user_message: str) -> list[str]:
-        """Decompose a multi-part question into sub-queries.
+        """Decompose a multi-part question into sub-queries using heuristics.
 
-        Returns a list of 1-3 queries. Returns [user_message] if decomposition
-        is not needed (heuristic check finds no comparison/multi-part signals).
+        No LLM call — splits on comparison patterns and conjunctions.
+        Returns a list of 1-3 queries.
         """
         lower = user_message.lower()
         if not any(s in lower for s in self._DECOMPOSE_SIGNALS):
             return [user_message]
 
-        try:
-            response = self.llm.complete([
-                {"role": "system", "content": (
-                    "Break down the following question into 2-3 simple sub-questions "
-                    "that can each be answered independently. Output one question per line. "
-                    "If the question is already simple, output it unchanged. "
-                    "Output ONLY the questions, nothing else."
-                )},
-                {"role": "user", "content": user_message},
-            ])
-            sub_queries = [
-                q.strip().strip("-•*123456789.)")
-                for q in response.strip().split("\n")
-                if q.strip()
-            ]
-            # Sanity: max 3, each must be a real question
-            sub_queries = [q for q in sub_queries if len(q) > 10][:3]
-            return sub_queries if sub_queries else [user_message]
-        except Exception:
-            return [user_message]
+        # Split on "compare X and Y" / "X vs Y" / "difference between X and Y"
+        import re
+        # "Compare Q3 and Q4 2025 financial performance"
+        m = re.search(r"compare\s+(.+?)\s+and\s+(.+?)(?:\s+(?:performance|data|results|numbers|stats))?$",
+                       user_message, re.IGNORECASE)
+        if m:
+            return [f"What is the {m.group(1).strip()} performance?",
+                    f"What is the {m.group(2).strip()} performance?"]
+
+        # "X vs Y"
+        m = re.search(r"(.+?)\s+(?:vs\.?|versus)\s+(.+)", user_message, re.IGNORECASE)
+        if m:
+            return [m.group(1).strip() + "?", m.group(2).strip() + "?"]
+
+        # "difference between X and Y"
+        m = re.search(r"difference\s+between\s+(.+?)\s+and\s+(.+)", user_message, re.IGNORECASE)
+        if m:
+            return [f"What is {m.group(1).strip()}?", f"What is {m.group(2).strip()}?"]
+
+        return [user_message]
 
     def _rewrite_query(self, user_message: str) -> str:
-        """Rewrite a follow-up question to be self-contained using conversation history.
+        """Rewrite a follow-up question using conversation history (no LLM call).
 
-        If the query contains pronouns or references that need context from
-        prior turns, expand them using a short LLM call. Otherwise return
-        the query unchanged. The original message (not the rewrite) must be
-        used for the LLM prompt so the user sees natural phrasing.
+        Replaces pronouns like 'it', 'they', 'them' with the most recent
+        entity/topic from the conversation. Fast heuristic — no LLM needed.
         """
         if not self._history:
             return user_message
 
-        # Quick check: does the query contain likely coreferences?
         words = set(user_message.lower().split())
         if not words & self._COREF_SIGNALS:
-            return user_message  # No coreferences detected — skip the extra call
+            return user_message
 
-        # Use the LLM to rewrite (one short call with minimal context)
-        rewrite_messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": (
-                    "Rewrite the user's follow-up question to be self-contained, "
-                    "replacing pronouns and references with the actual entities from "
-                    "the conversation. Output ONLY the rewritten question, nothing else. "
-                    "If the question is already self-contained, output it unchanged."
-                ),
-            },
-        ]
-        # Include last 2 turns of history for context (4 messages)
-        for msg in self._history[-4:]:
-            rewrite_messages.append(msg)
-        rewrite_messages.append(
-            {"role": "user", "content": f"Rewrite this question: {user_message}"}
-        )
+        # Find the most recent topic from the last user message
+        last_user_msgs = [m["content"] for m in self._history if m["role"] == "user"]
+        if not last_user_msgs:
+            return user_message
 
-        try:
-            rewritten = self.llm.complete(rewrite_messages).strip()
-            # Sanity check: rewritten should be similar length, not a full answer
-            if (len(rewritten) < len(user_message) * 3 and '?' in rewritten) or len(rewritten) < 200:
-                return rewritten
-        except Exception:
-            pass
+        # Extract likely topic: longest capitalized phrase or noun from last question
+        import re
+        last_q = last_user_msgs[-1]
+        # Look for capitalized phrases (proper nouns / entity names)
+        names = re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*', last_q)
+        topic = max(names, key=len) if names else ""
 
-        return user_message
+        if not topic:
+            # Fall back to significant words from last question
+            _stop = {"what", "is", "the", "our", "how", "who", "does", "do",
+                     "are", "was", "can", "will", "and", "or", "for", "about"}
+            sig_words = [w for w in last_q.split() if w.lower() not in _stop and len(w) > 3]
+            topic = " ".join(sig_words[:3]) if sig_words else ""
+
+        if not topic:
+            return user_message
+
+        # Replace pronouns with the topic
+        rewritten = user_message
+        for pronoun in ['it', 'its', 'they', 'them', 'their', 'this', 'that']:
+            rewritten = re.sub(
+                rf'\b{pronoun}\b',
+                topic,
+                rewritten,
+                flags=re.IGNORECASE,
+                count=1,
+            )
+
+        return rewritten
 
     # Keywords that suggest a tabular / analytical question
     _TABULAR_SIGNALS: frozenset[str] = frozenset({
