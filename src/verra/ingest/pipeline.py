@@ -81,6 +81,19 @@ def ingest_folder(
     stats = IngestStats()
     t0 = time.monotonic()
 
+    # Batch-embedding buffer: accumulate chunks across files and flush to
+    # ChromaDB in batches for better ONNX throughput.
+    EMBED_BATCH_SIZE = 100
+    _embed_buffer_ids: list[Any] = []
+    _embed_buffer_chunks: list[Any] = []
+
+    def _flush_embed_buffer() -> None:
+        if not _embed_buffer_ids:
+            return
+        vector_store.add_chunks(_embed_buffer_ids, _embed_buffer_chunks)
+        _embed_buffer_ids.clear()
+        _embed_buffer_chunks.clear()
+
     # Collect the full list of candidate files up-front so we can report a
     # meaningful ``files_total`` to the progress callback.
     all_files = list(crawl_folder(folder_path))
@@ -147,22 +160,20 @@ def ingest_folder(
 
             # Near-duplicate detection: compare new chunks against existing
             # stored chunk texts before embedding.
+            # Skip when corpus is large — the O(n*m) cost becomes a bottleneck.
             existing_chunk_texts = metadata_store.get_all_chunk_texts()
-            if existing_chunk_texts:
+            dup_pairs: list[tuple[int, int, float]] = []
+            if existing_chunk_texts and len(existing_chunk_texts) < 10000:
                 dup_pairs = find_near_duplicates(chunks, existing_chunk_texts)
                 for new_idx, existing_id, score in dup_pairs:
-                    # Tag the chunk metadata so retrieval can de-rank duplicates.
                     chunks[new_idx].metadata["near_duplicate_of"] = existing_id
                     chunks[new_idx].metadata["near_duplicate_score"] = round(score, 4)
                     stats.near_duplicates_found += 1
 
             chunk_ids = metadata_store.add_chunks(doc_id, chunks, authority_weight=authority_weight)
 
-            # Persist near-duplicate relationships now that we have chunk_ids.
-            for new_idx, existing_id, score in (
-                find_near_duplicates(chunks, existing_chunk_texts)
-                if existing_chunk_texts else []
-            ):
+            # Persist near-duplicate relationships (reuse already-computed pairs).
+            for new_idx, existing_id, score in dup_pairs:
                 metadata_store.add_near_duplicate(
                     chunk_id=chunk_ids[new_idx],
                     near_duplicate_of=existing_id,
@@ -186,7 +197,11 @@ def ingest_folder(
                             confidence=res.get("confidence", 0.5),
                         )
 
-            vector_store.add_chunks(chunk_ids, chunks)
+            # Accumulate into embedding buffer; flush when batch is full.
+            _embed_buffer_ids.extend(chunk_ids)
+            _embed_buffer_chunks.extend(chunks)
+            if len(_embed_buffer_ids) >= EMBED_BATCH_SIZE:
+                _flush_embed_buffer()
 
             # Entity extraction (if entity store provided)
             if entity_store is not None:
@@ -237,6 +252,9 @@ def ingest_folder(
         finally:
             if progress_callback is not None:
                 progress_callback(file_path, stats.files_processed, files_total)
+
+    # Flush any remaining chunks that didn't fill a complete batch.
+    _flush_embed_buffer()
 
     # Compute quality metrics across the whole batch if any files were processed.
     if stats.chunks_created > 0:
