@@ -99,19 +99,16 @@ def search(
         return _metadata_search(query, metadata_store, n_results)
     elif query.query_type == QueryType.SEMANTIC:
         results = _semantic_search(query, vector_store, n_results)
-        # If semantic search returned low-confidence results, supplement with
-        # keyword search through the actual chunk text in the vector store
-        if results and max(r.score for r in results) < -0.3:
-            keyword_hits = _keyword_fallback(query, vector_store, n_results)
-            if keyword_hits:
-                # Merge: add keyword hits that aren't already in results
-                existing_ids = {r.chunk_id for r in results}
-                for kh in keyword_hits:
-                    if kh.chunk_id not in existing_ids:
-                        results.append(kh)
-                        existing_ids.add(kh.chunk_id)
-                results.sort(key=lambda r: r.score, reverse=True)
-                results = results[:n_results]
+        # Always supplement with keyword search — embeddings miss specific
+        # names, acronyms, and terms that keyword matching catches reliably.
+        keyword_hits = _keyword_fallback(query, vector_store, n_results)
+        if keyword_hits:
+            existing_ids = {r.chunk_id for r in results}
+            for kh in keyword_hits:
+                if kh.chunk_id not in existing_ids:
+                    results.append(kh)
+                    existing_ids.add(kh.chunk_id)
+            results = rank_by_authority(results)[:n_results]
         return results
     else:
         return _hybrid_search(query, metadata_store, vector_store, n_results)
@@ -156,8 +153,17 @@ def _keyword_fallback(
         if matches == 0:
             continue
         ratio = matches / len(keywords)
-        # Score based on keyword match ratio
-        score = ratio * 0.5  # max +0.5 for full match
+        # Score based on keyword match ratio — high enough to compete
+        # with embedding results, since keyword hits are often more precise
+        score = ratio * 0.8  # max +0.8 for full match
+
+        # Penalize CSV chunks same as in semantic search
+        if (meta or {}).get("format") == "csv":
+            score -= 0.4
+
+        if score <= 0:
+            continue
+
         scored.append((score, SearchResult(
             chunk_id=chunk_id,
             text=text,
@@ -167,7 +173,20 @@ def _keyword_fallback(
         )))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [sr for _, sr in scored[:n_results]]
+
+    # Document diversity: max 2 per file
+    diverse: list[SearchResult] = []
+    doc_counts: dict[str, int] = {}
+    for _, sr in scored:
+        fname = sr.metadata.get("file_name", "")
+        count = doc_counts.get(fname, 0)
+        if count < 2:
+            diverse.append(sr)
+            doc_counts[fname] = count + 1
+        if len(diverse) >= n_results:
+            break
+
+    return diverse
 
 
 # Internal strategies
@@ -212,8 +231,9 @@ def _semantic_search(
     if query.source_type:
         where = {"source_type": query.source_type}
 
-    # Fetch more candidates than needed, then re-rank and trim
-    fetch_n = max(n_results * 2, 15)
+    # Fetch many more candidates than needed — when the corpus is dominated
+    # by CSV chunks we need to dig deep to find the relevant prose docs.
+    fetch_n = max(n_results * 5, 60)
     hits = vector_store.search(query.semantic_text, n_results=fetch_n, where=where)
 
     # Fall back to unfiltered search if source_type filter returned nothing
@@ -256,6 +276,12 @@ def _semantic_search(
         elif doc_len < 1500:
             score += 0.05
 
+        # Penalize CSV chunks — they're repetitive tabular data that
+        # overwhelm prose documents when the corpus has large CSVs.
+        doc_format = h["metadata"].get("format", "")
+        if doc_format == "csv":
+            score -= 0.4
+
         results.append(SearchResult(
             chunk_id=h["id"],
             text=text,
@@ -264,6 +290,19 @@ def _semantic_search(
             authority_weight=int(h["metadata"].get("authority_weight", 50)),
             valid_from=h["metadata"].get("valid_from") or h["metadata"].get("date"),
         ))
+
+    # Document diversity: limit to max 2 chunks per source file
+    # to prevent large files from dominating results.
+    if len(results) > n_results:
+        diverse: list[SearchResult] = []
+        doc_counts: dict[str, int] = {}
+        for r in sorted(results, key=lambda x: x.score, reverse=True):
+            fname = r.metadata.get("file_name", "")
+            count = doc_counts.get(fname, 0)
+            if count < 2:
+                diverse.append(r)
+                doc_counts[fname] = count + 1
+        results = diverse
 
     ranked = rank_by_authority(results)
     return ranked[:n_results]

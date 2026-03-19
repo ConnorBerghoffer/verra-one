@@ -31,6 +31,18 @@ Rules:
 - Be concise. Use bullet points.
 """
 
+_STREAM_SYSTEM_PROMPT = """You are Verra, a private AI assistant that helps the user understand their business data.
+
+Rules:
+- Base your answers ONLY on the provided context below.
+- When context contains conflicting information, prefer the source with the most recent date. Flag the conflict.
+- If the context doesn't contain enough information, say "I don't have that information in your data."
+- Cite sources by file name (e.g. "according to Q4_2025_Financial_Summary.txt").
+- Be thorough — list ALL relevant items, don't truncate lists.
+- Be concise. Use bullet points.
+- When doing math, show your work step by step.
+"""
+
 _NO_ANSWER = (
     "I don't have enough information in your data to answer that question confidently.\n"
     "Try ingesting more documents or rephrasing your question."
@@ -144,7 +156,7 @@ class ChatEngine:
         metadata_store: MetadataStore,
         vector_store: VectorStore,
         memory_store: MemoryStore,
-        n_results: int = 8,
+        n_results: int = 12,
         conversation_id: int | None = None,
         entity_store: Any | None = None,       # EntityStore
     ) -> None:
@@ -223,7 +235,7 @@ class ChatEngine:
             classified,
             self.metadata_store,
             self.vector_store,
-            n_results=self.n_results,
+            n_results=self.n_results + 4,
             entity_store=self.entity_store,
         )
 
@@ -235,7 +247,7 @@ class ChatEngine:
 
         context_blocks = _format_context(results)
         messages = _build_messages(
-            system=_SYSTEM_PROMPT,
+            system=_STREAM_SYSTEM_PROMPT,
             history=self._history,
             context=context_blocks,
             user_message=user_message,
