@@ -134,18 +134,51 @@ def rank_by_authority(results: list[SearchResult]) -> list[SearchResult]:
     return sorted(results, key=_composite, reverse=True)
 
 
+def _hyde_expand(query_text: str, llm_client: Any = None) -> str:
+    """Generate a hypothetical document that would answer the query.
+
+    This hypothetical text is then embedded for search, which produces
+    embeddings much closer to actual document embeddings than the raw
+    question would.
+    """
+    if llm_client is None:
+        return query_text
+
+    try:
+        response = llm_client.complete([
+            {"role": "system", "content": (
+                "Write a short paragraph (3-5 sentences) that would be found in a "
+                "business document answering the following question. Write it as if "
+                "it's an excerpt from the actual document, not as an answer. "
+                "Include specific details, names, numbers where plausible. "
+                "Output ONLY the paragraph, nothing else."
+            )},
+            {"role": "user", "content": query_text},
+        ])
+        return response.strip()
+    except Exception:
+        return query_text
+
+
 def search(
     query: ClassifiedQuery,
     metadata_store: MetadataStore,
     vector_store: VectorStore,
     n_results: int = 5,
     entity_store: Any | None = None,  # EntityStore, optional to avoid circular import
+    llm_client: Any | None = None,    # LLMClient, optional; enables HyDE when provided
 ) -> list[SearchResult]:
     """Run hybrid retrieval and return ranked results.
 
     If entity_store is provided and the query text mentions known entities,
     entity-based retrieval is tried first. Falls back to standard strategies
     if no entity matches are found.
+
+    If llm_client is provided, HyDE (Hypothetical Document Embedding) is used
+    for the semantic search path: a hypothetical answer is generated and its
+    embedding is used for vector search instead of the raw query embedding.
+    The original query text is still used for keyword/BM25/filename search and
+    for the LLM generation step.  HyDE adds ~2s latency (one extra LLM call).
     """
     # Try entity-based retrieval when an entity store is available
     if entity_store is not None:
@@ -159,9 +192,16 @@ def search(
                                QueryType.TEMPORAL_TREND, QueryType.HYPOTHETICAL,
                                QueryType.META, QueryType.GAP, QueryType.MULTI_HOP,
                                QueryType.STATE_LOOKUP):
+        # Generate HyDE text for better embedding search.
+        # HyDE text is used ONLY for the vector search embedding; original query
+        # text is used for keyword/BM25/filename search.
+        hyde_text: str | None = None
+        if llm_client is not None:
+            hyde_text = _hyde_expand(query.semantic_text, llm_client)
+
         # Gather candidates from all retrieval strategies.
         # _semantic_search returns a larger candidate set without final reranking.
-        embedding_results = _semantic_search(query, vector_store, n_results)
+        embedding_results = _semantic_search(query, vector_store, n_results, hyde_text=hyde_text)
 
         # Supplement with keyword search — catches specific names, acronyms
         keyword_hits = _keyword_fallback(query, vector_store, n_results)
@@ -461,27 +501,37 @@ def _semantic_search(
     query: ClassifiedQuery,
     vector_store: VectorStore,
     n_results: int,
+    hyde_text: str | None = None,
 ) -> list[SearchResult]:
     """Pure vector similarity search returning a larger candidate pool.
 
     Returns up to ``n_results * 2`` diversity-filtered results so the
     caller (search()) can merge with other retrieval strategies before
     cross-encoder reranking.  Final trimming to n_results happens there.
+
+    If hyde_text is provided it is used as the embedding query instead of the
+    raw query text.  Keyword scoring still uses query.semantic_text so HyDE
+    does not corrupt non-embedding signals.
     """
     where: dict[str, Any] | None = None
     if query.source_type:
         where = {"source_type": query.source_type}
 
+    # HyDE: use the hypothetical document text for embedding search when available.
+    # The original query text is kept for keyword-overlap scoring below.
+    search_text = hyde_text if hyde_text is not None else query.semantic_text
+
     # Fetch many more candidates than needed — when the corpus is dominated
     # by CSV chunks we need to dig deep to find the relevant prose docs.
     fetch_n = max(n_results * 5, 60)
-    hits = vector_store.search(query.semantic_text, n_results=fetch_n, where=where)
+    hits = vector_store.search(search_text, n_results=fetch_n, where=where)
 
     # Fall back to unfiltered search if source_type filter returned nothing
     if not hits and where is not None:
-        hits = vector_store.search(query.semantic_text, n_results=fetch_n, where=None)
+        hits = vector_store.search(search_text, n_results=fetch_n, where=None)
 
-    # Extract significant query keywords for keyword-boost scoring
+    # Extract significant query keywords for keyword-boost scoring.
+    # Always derived from the original query, not the HyDE expansion.
     _stop = {"what", "is", "the", "our", "how", "many", "much", "who", "does",
              "do", "are", "was", "were", "can", "will", "a", "an", "and", "or",
              "for", "in", "on", "at", "to", "of", "by", "from", "with", "about"}
