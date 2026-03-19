@@ -1,15 +1,27 @@
 """ChromaDB vector store wrapper.
 
 Uses ChromaDB's PersistentClient (embedded mode, no separate server).
-The default embedding function (chromadb.utils.embedding_functions.DefaultEmbeddingFunction)
-is used so no external embedding API is needed for the MVP.
+Embedding model: nomic-ai/nomic-embed-text-v1.5 (768-dim, matryoshka).
+Requires `einops` in the environment — installed automatically with `pip install einops`.
 
 Collection name: "verra_chunks"
+
+**Important — model migration note**:
+If you switch embedding models on an existing Verra installation the stored
+vectors are incompatible with the new model and searches will silently return
+wrong results.  Re-ingest from scratch after any model change:
+
+    rm -rf ~/.verra/chroma
+    verra ingest <data-dir>
+
+The collection metadata key ``embedding_model`` records which model was used
+so that future tooling can detect mismatches automatically.
 """
 
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +30,46 @@ if TYPE_CHECKING:
 
 
 _COLLECTION_NAME = "verra_chunks"
+_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+
+logger = logging.getLogger(__name__)
+
+
+def _make_embedding_function() -> Any:
+    """Return a SentenceTransformerEmbeddingFunction for *_EMBEDDING_MODEL*.
+
+    Falls back to ``all-MiniLM-L12-v2`` if the nomic model cannot be loaded
+    (e.g. missing ``einops`` or network issues), then to ``BAAI/bge-small-en-v1.5``
+    as a last resort.
+    """
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+    candidates = [
+        dict(model_name=_EMBEDDING_MODEL, trust_remote_code=True),
+        dict(model_name="all-MiniLM-L12-v2"),
+        dict(model_name="BAAI/bge-small-en-v1.5"),
+    ]
+
+    for kwargs in candidates:
+        try:
+            ef = SentenceTransformerEmbeddingFunction(**kwargs)
+            # Warm-up: confirm the model actually loads before returning
+            ef(["warmup"])
+            model_name = kwargs["model_name"]
+            if model_name != _EMBEDDING_MODEL:
+                logger.warning(
+                    "nomic-embed-text-v1.5 unavailable; using fallback embedding "
+                    "model %r.  Retrieval quality may differ.",
+                    model_name,
+                )
+            return ef, model_name
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Embedding model %r failed to load: %s", kwargs["model_name"], exc)
+
+    raise RuntimeError(
+        "No embedding model could be loaded.  Install `einops` and ensure "
+        "sentence-transformers is available: pip install einops sentence-transformers"
+    )
 
 
 class VectorStore:
@@ -29,12 +81,42 @@ class VectorStore:
         self._persist_dir = Path(persist_dir)
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._client = chromadb.PersistentClient(path=str(self._persist_dir))
-        # get_or_create is idempotent — safe to call on every startup
+
+        # Use nomic-embed-text-v1.5 for better retrieval quality (768-dim,
+        # matryoshka representation learning).  Falls back gracefully if the
+        # model is unavailable — see _make_embedding_function() above.
+        self._embedding_fn, self._active_model = _make_embedding_function()
+
         self._collection = self._client.get_or_create_collection(
             name=_COLLECTION_NAME,
-            # Default embedding function (all-MiniLM-L6-v2 via onnxruntime)
-            # is fetched on first use if not cached.
+            embedding_function=self._embedding_fn,
+            # Record the model in collection metadata so future tooling can
+            # detect incompatible re-opens (e.g. after a model change).
+            metadata={"embedding_model": self._active_model},
         )
+
+        self._warn_model_mismatch()
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _warn_model_mismatch(self) -> None:
+        """Log a warning if the collection was built with a different model.
+
+        ChromaDB does not enforce embedding-function consistency across opens,
+        so we store the model name in collection metadata ourselves and check
+        it at startup.
+        """
+        stored = (self._collection.metadata or {}).get("embedding_model")
+        if stored and stored != self._active_model:
+            logger.warning(
+                "Vector store mismatch: collection was indexed with %r but the "
+                "active embedding model is %r.  Search results will be unreliable. "
+                "Re-ingest from scratch: rm -rf ~/.verra/chroma && verra ingest <dir>",
+                stored,
+                self._active_model,
+            )
 
     # ------------------------------------------------------------------
     # Write
@@ -134,8 +216,7 @@ class VectorStore:
             if ids_to_delete:
                 self._collection.delete(ids=ids_to_delete)
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Failed to delete vectors for document_id=%s: %s", document_id, exc
             )
 
@@ -146,4 +227,8 @@ class VectorStore:
     def reset(self) -> None:
         """Delete and recreate the collection (for testing)."""
         self._client.delete_collection(_COLLECTION_NAME)
-        self._collection = self._client.get_or_create_collection(name=_COLLECTION_NAME)
+        self._collection = self._client.get_or_create_collection(
+            name=_COLLECTION_NAME,
+            embedding_function=self._embedding_fn,
+            metadata={"embedding_model": self._active_model},
+        )
