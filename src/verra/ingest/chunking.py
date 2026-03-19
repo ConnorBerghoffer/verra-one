@@ -190,6 +190,64 @@ def _apply_code_awareness(chunks: list[Chunk]) -> list[Chunk]:
     return result
 
 
+def _add_parent_context(
+    chunks: list[Chunk],
+    full_text: str,
+    parent_window: int = 2000,
+) -> None:
+    """Add parent context to each chunk's metadata.
+
+    For each chunk, locates it within the full document text and extracts a
+    larger surrounding window. This parent text is stored in
+    ``chunk.metadata["parent_text"]`` so the LLM receives richer context while
+    the smaller chunk text is still used for embedding / semantic search.
+
+    The window expands outward from the chunk position: one quarter of
+    ``parent_window`` is taken from before the chunk and the remainder (plus
+    the chunk itself) from after, then both ends are snapped to the nearest
+    sentence boundary. The result is capped at ``parent_window`` characters.
+
+    Falls back to the chunk text itself when the chunk cannot be located in
+    the full document (e.g. after overlap stitching or code summarisation).
+    """
+    for chunk in chunks:
+        # Use the first 100 chars of the chunk text as a locator. For code-
+        # summarised chunks we fall back to the original_text if present so
+        # we still anchor to actual document content.
+        anchor = chunk.metadata.get("original_text", chunk.text)
+        anchor_prefix = anchor[:100]
+        pos = full_text.find(anchor_prefix)
+        if pos == -1:
+            chunk.metadata["parent_text"] = chunk.text
+            continue
+
+        # Determine the span of the chunk within the full text
+        chunk_len = len(anchor)
+
+        # Carve out a window: 25 % before, rest after + chunk length
+        before = parent_window // 4
+        after = parent_window - before
+
+        start = max(0, pos - before)
+        end = min(len(full_text), pos + chunk_len + after)
+
+        # Snap start backward to the nearest sentence / paragraph boundary
+        while start > 0 and full_text[start] not in ".!?\n":
+            start -= 1
+
+        # Snap end forward to the nearest sentence / paragraph boundary
+        while end < len(full_text) and full_text[end] not in ".!?\n":
+            end += 1
+
+        parent = full_text[start:end].strip()
+
+        # Hard cap
+        if len(parent) > parent_window:
+            parent = parent[:parent_window]
+
+        chunk.metadata["parent_text"] = parent
+
+
 def chunk_document(
     text: str,
     metadata: dict[str, Any] | None = None,
@@ -262,6 +320,10 @@ def chunk_document(
 
     chunks_with_overlap = _make_overlap(chunks)
     final_chunks = _apply_code_awareness(chunks_with_overlap)
+
+    # Add parent context to every chunk so the LLM sees surrounding text.
+    # Called before the attachment prefix so anchors still match the raw doc.
+    _add_parent_context(final_chunks, text)
 
     # Prepend attachment context to the first chunk so retrieval can use
     # the referring email's content when ranking attachment chunks.

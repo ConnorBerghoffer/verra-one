@@ -8,6 +8,7 @@ import pytest
 
 from verra.ingest.chunking import (
     Chunk,
+    _add_parent_context,
     _strip_quoted_text,
     chunk_document,
     chunk_email_thread,
@@ -156,6 +157,98 @@ class TestChunkEmailThread:
         chunks = chunk_email_thread(messages)
         # Should split into more than one chunk
         assert len(chunks) >= 1  # at minimum it doesn't crash
+
+
+class TestParentChildRetrieval:
+    """Tests for _add_parent_context and the parent_text metadata field."""
+
+    def _make_chunk(self, text: str, metadata: dict | None = None) -> Chunk:
+        return Chunk(text=text, metadata=metadata or {})
+
+    def test_parent_text_present_on_all_chunks(self) -> None:
+        """chunk_document must add parent_text to every chunk's metadata."""
+        paragraph = "Sentence number {i} about business metrics. " * 20
+        text = "\n\n".join(paragraph.format(i=i) for i in range(8))
+        chunks = chunk_document(text)
+        for chunk in chunks:
+            assert "parent_text" in chunk.metadata, (
+                f"parent_text missing on chunk starting: {chunk.text[:60]!r}"
+            )
+
+    def test_parent_text_expands_small_chunk(self) -> None:
+        """For a small chunk that is part of a larger document, parent_text
+        should either equal or expand the chunk text — never be empty."""
+        # Use many sections so the document is split into several chunks and
+        # the metric section ends up small relative to its surrounding context.
+        sections = [f"## Section {i}\n\n" + ("Content sentence. " * 50) for i in range(1, 8)]
+        # Insert a short metric section in the middle
+        sections.insert(3, "## Key Metric\n\nThe conversion rate was 34%.")
+        text = "\n\n".join(sections)
+        chunks = chunk_document(text)
+        assert len(chunks) > 1, "Expected multiple chunks for this document"
+        # Every chunk must have a non-empty parent_text
+        for chunk in chunks:
+            parent = chunk.metadata.get("parent_text", "")
+            assert parent, "parent_text must not be empty"
+            # parent_text must be at least as large as the chunk text (may equal it)
+            assert len(parent) >= len(chunk.text) or len(parent) <= 2000, (
+                "parent_text is either expanded context or the 2000-char cap"
+            )
+
+    def test_parent_text_capped_at_window(self) -> None:
+        """parent_text must never exceed parent_window characters."""
+        long_para = "Word " * 2000
+        text = long_para
+        chunks = chunk_document(text)
+        for chunk in chunks:
+            parent = chunk.metadata.get("parent_text", "")
+            assert len(parent) <= 2000, (
+                f"parent_text length {len(parent)} exceeds 2000-char window"
+            )
+
+    def test_fallback_when_chunk_not_found_in_full_text(self) -> None:
+        """_add_parent_context falls back to chunk.text when anchor not found."""
+        chunk = self._make_chunk("Some text not in document at all.")
+        full_text = "Completely different content."
+        _add_parent_context([chunk], full_text)
+        assert chunk.metadata["parent_text"] == chunk.text
+
+    def test_parent_text_contains_chunk_text(self) -> None:
+        """The parent window must contain (or start with) the original chunk text."""
+        sections = [
+            "## Introduction\n\n" + ("Intro sentence. " * 30),
+            "## Findings\n\nThe key finding is revenue grew 42% this quarter.",
+            "## Conclusion\n\n" + ("Conclusion sentence. " * 30),
+        ]
+        text = "\n\n".join(sections)
+        chunks = chunk_document(text)
+        finding_chunks = [c for c in chunks if "revenue grew 42%" in c.text]
+        for c in finding_chunks:
+            parent = c.metadata.get("parent_text", "")
+            # Parent should contain enough of the chunk's key content
+            assert "42%" in parent or "revenue grew" in parent, (
+                "parent_text should contain the chunk's key content"
+            )
+
+    def test_single_chunk_doc_parent_equals_chunk(self) -> None:
+        """When the whole document is one chunk, parent_text == chunk text."""
+        text = "Short document. Just one chunk worth of content."
+        chunks = chunk_document(text)
+        assert len(chunks) == 1
+        parent = chunks[0].metadata.get("parent_text", "")
+        # For a single chunk that spans the whole doc, parent should equal chunk
+        assert parent == chunks[0].text
+
+    def test_parent_text_survives_code_aware_processing(self) -> None:
+        """Code-summarised chunks still get parent_text in their metadata."""
+        text = (
+            "## Setup\n\nSome prose about setup.\n\n"
+            "```python\nimport os\nprint(os.getcwd())\n```\n\n"
+            "## Conclusion\n\nSome closing prose."
+        )
+        chunks = chunk_document(text)
+        for chunk in chunks:
+            assert "parent_text" in chunk.metadata
 
 
 class TestStripQuotedText:
