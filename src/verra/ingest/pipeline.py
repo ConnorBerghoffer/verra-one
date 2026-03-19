@@ -126,6 +126,7 @@ def ingest_folder(
 
     # Collect the full list of candidate files up-front so we can report a
     # meaningful ``files_total`` to the progress callback.
+    files_total = 0
     _emit(None, "scan", "crawling folder")
     all_files = list(crawl_folder(folder_path))
     files_total = len(all_files)
