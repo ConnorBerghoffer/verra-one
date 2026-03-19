@@ -191,7 +191,7 @@ class ChatEngine:
         metadata_store: MetadataStore,
         vector_store: VectorStore,
         memory_store: MemoryStore,
-        n_results: int = 12,
+        n_results: int = 10,
         conversation_id: int | None = None,
         entity_store: Any | None = None,       # EntityStore
         tabular_store: Any | None = None,      # TabularStore
@@ -788,9 +788,23 @@ class ChatEngine:
         if not any(signal in lower_msg for signal in self._TABULAR_SIGNALS):
             return None
 
-        # Build schema description with sample data for the prompt
-        table_schemas: list[str] = []
+        # Only include tables whose names are relevant to the query
+        # (sending 31 table schemas confuses the model and wastes tokens)
+        import re as _re
+        query_words = set(_re.findall(r'\w+', user_message.lower()))
+        relevant_tables = []
         for t in tables:
+            tn = t["table_name"].lower()
+            # Include table if any query word appears in the table name
+            if any(w in tn for w in query_words if len(w) >= 3):
+                relevant_tables.append(t)
+        # If nothing matched, include all tables with < 10 columns (skip giant ones)
+        if not relevant_tables:
+            relevant_tables = [t for t in tables if len(t["columns"]) <= 10][:8]
+
+        # Build schema with samples and pre-computed summaries
+        table_schemas: list[str] = []
+        for t in relevant_tables:
             cols = ", ".join(
                 f"{c['name']} ({c['type']})" for c in t["columns"]
             )
@@ -803,6 +817,12 @@ class ChatEngine:
                     vals = ", ".join(f"{k}={v!r}" for k, v in list(s.items())[:6])
                     sample_strs.append(f"  Example: {vals}")
                 schema_line += "\n" + "\n".join(sample_strs)
+            # Include pre-computed summaries for value distributions
+            summaries = self.tabular_store.get_summaries(t["table_name"])
+            for key, val in summaries.items():
+                if key.startswith("value_counts:"):
+                    col = key.split(":", 1)[1]
+                    schema_line += f"\n  Distinct values for {col}: {val}"
             table_schemas.append(schema_line)
 
         sql_prompt: list[dict[str, Any]] = [

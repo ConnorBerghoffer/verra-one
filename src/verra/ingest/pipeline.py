@@ -388,6 +388,13 @@ def ingest_folder(
     # Flush any remaining chunks that did not fill a complete batch.
     _flush_embed_buffer()
 
+    # Pre-compute table summaries for fast SQL at query time.
+    if tabular_store is not None:
+        try:
+            tabular_store.precompute_summaries()
+        except Exception:
+            pass
+
     # Compute quality metrics across the whole batch if any files were processed.
     if stats.chunks_created > 0:
         # We don't carry the full chunk list across iterations, so recompute

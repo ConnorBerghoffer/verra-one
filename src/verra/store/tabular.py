@@ -288,6 +288,64 @@ class TabularStore:
         except Exception:
             return []
 
+    def precompute_summaries(self) -> None:
+        """Pre-compute common aggregations for all tables (runs at ingest time)."""
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS _summaries (
+                table_name TEXT,
+                summary_type TEXT,
+                summary_text TEXT,
+                PRIMARY KEY (table_name, summary_type)
+            )
+        """)
+        for t in self.list_tables():
+            tn = t["table_name"]
+            safe = re.sub(r"[^a-zA-Z0-9_]", "", tn)
+            cols = t["columns"]
+            try:
+                # Row count
+                count = self._conn.execute(f"SELECT COUNT(*) FROM [{safe}]").fetchone()[0]
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO _summaries VALUES (?, ?, ?)",
+                    (tn, "row_count", str(count)),
+                )
+                # For each text column: distinct value counts (top 10)
+                for c in cols:
+                    cn = re.sub(r"[^a-zA-Z0-9_]", "_", c["name"])
+                    if c["type"] == "TEXT":
+                        rows = self._conn.execute(
+                            f"SELECT [{cn}], COUNT(*) as cnt FROM [{safe}] GROUP BY [{cn}] ORDER BY cnt DESC LIMIT 10"
+                        ).fetchall()
+                        if rows:
+                            lines = [f"{r[0]}: {r[1]}" for r in rows]
+                            self._conn.execute(
+                                "INSERT OR REPLACE INTO _summaries VALUES (?, ?, ?)",
+                                (tn, f"value_counts:{c['name']}", "\n".join(lines)),
+                            )
+                    elif c["type"] == "REAL":
+                        row = self._conn.execute(
+                            f"SELECT MIN([{cn}]), MAX([{cn}]), AVG([{cn}]), SUM([{cn}]) FROM [{safe}]"
+                        ).fetchone()
+                        if row:
+                            self._conn.execute(
+                                "INSERT OR REPLACE INTO _summaries VALUES (?, ?, ?)",
+                                (tn, f"stats:{c['name']}", f"min={row[0]}, max={row[1]}, avg={row[2]:.2f}, sum={row[3]:.2f}"),
+                            )
+                self._conn.commit()
+            except Exception:
+                pass
+
+    def get_summaries(self, table_name: str) -> dict[str, str]:
+        """Return pre-computed summaries for a table."""
+        try:
+            rows = self._conn.execute(
+                "SELECT summary_type, summary_text FROM _summaries WHERE table_name = ?",
+                (table_name,),
+            ).fetchall()
+            return {r[0]: r[1] for r in rows}
+        except Exception:
+            return {}
+
     def close(self) -> None:
         """Close the database connection."""
         try:
