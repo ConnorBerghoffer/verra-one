@@ -5,11 +5,16 @@ Chat with all your business data — emails, documents, spreadsheets. Runs local
 ## Install
 
 ```bash
-pip install verra-one
-verra
+curl -fsSL https://raw.githubusercontent.com/ConnorBerghoffer/verra-one/main/install.sh | sh
 ```
 
-First run walks you through setup (pick a model, point at your data).
+Or with pip:
+
+```bash
+pip install verra-one
+```
+
+Then run `verra` — first run walks you through setup.
 
 ## What it does
 
