@@ -3,7 +3,7 @@
 Authentication:
   - Uses InstalledAppFlow for the desktop OAuth flow.
   - Tokens are persisted in ~/.verra/oauth/<account>_token.json.
-  - client_secret.json must live in ~/.verra/oauth/ (or a custom credentials_dir).
+  - credentials.json must live in ~/.verra/oauth/ (shared with Drive — same Google Cloud project).
 
 Usage:
   ingestor = GmailIngestor("you@gmail.com")
@@ -182,8 +182,8 @@ class GmailIngestor:
         self._oauth_dir = Path(credentials_dir) if credentials_dir else VERRA_HOME / "oauth"
         self._oauth_dir.mkdir(parents=True, exist_ok=True)
 
-        # Derived paths
-        self._client_secret_path = self._oauth_dir / "client_secret.json"
+        # Derived paths — credentials.json is shared with Drive (same Google Cloud project)
+        self._credentials_path = self._oauth_dir / "credentials.json"
         # Per-account token so multiple accounts can coexist
         safe_account = re.sub(r"[^a-zA-Z0-9._-]", "_", account)
         self._token_path = self._oauth_dir / f"{safe_account}_token.json"
@@ -210,7 +210,7 @@ class GmailIngestor:
                 "pip install google-auth-oauthlib google-api-python-client"
             ) from exc
 
-        if not self._client_secret_path.exists():
+        if not self._credentials_path.exists():
             self._print_setup_instructions()
             return False
 
@@ -230,7 +230,7 @@ class GmailIngestor:
 
         if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(
-                str(self._client_secret_path), _SCOPES
+                str(self._credentials_path), _SCOPES
             )
             creds = flow.run_local_server(port=0)
 
@@ -248,15 +248,16 @@ class GmailIngestor:
 
     def _print_setup_instructions(self) -> None:
         print(
-            "\nTo connect Gmail, create a Google Cloud project and download credentials:\n"
-            "  1. Go to https://console.cloud.google.com/\n"
-            "  2. Create a new project (or select an existing one)\n"
-            "  3. Enable the Gmail API  (APIs & Services > Enable APIs > search 'Gmail API')\n"
-            "  4. Create OAuth credentials  (APIs & Services > Credentials > Create Credentials\n"
-            "     > OAuth client ID > Desktop app)\n"
-            "  5. Download the JSON file and save it as:\n"
-            f"     {self._client_secret_path}\n"
-            "  6. Re-run this command.\n"
+            "\n  Gmail requires OAuth credentials. One-time setup:\n"
+            "\n"
+            "  1. Go to console.cloud.google.com\n"
+            "  2. Create a project (or use existing)\n"
+            "  3. Enable the Gmail API\n"
+            "  4. Create OAuth 2.0 credentials -> Desktop application\n"
+            "  5. Download the JSON file\n"
+            f"  6. Save it as: {self._credentials_path}\n"
+            "\n"
+            f"  Then run: verra gmail {self.account}\n"
         )
 
     def _require_service(self) -> Any:

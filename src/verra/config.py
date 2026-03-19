@@ -63,6 +63,7 @@ class SourceConfig(BaseModel):
     account: str | None = None
     labels: list[str] = Field(default_factory=list)
     since: str | None = None  # ISO date string, e.g. "2023-01-01"
+    client_id: str | None = None  # Azure AD app client ID (Outlook only)
 
 
 class SyncConfig(BaseModel):

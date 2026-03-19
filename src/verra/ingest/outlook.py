@@ -58,10 +58,7 @@ class OutlookIngestor:
             return False
 
         if not self.client_id:
-            logger.error(
-                "Azure AD client_id required. Register at "
-                "https://portal.azure.com -> App registrations"
-            )
+            self._print_setup_instructions()
             return False
 
         _TOKEN_DIR.mkdir(parents=True, exist_ok=True)
@@ -103,6 +100,24 @@ class OutlookIngestor:
             except OSError:
                 pass
         return True
+
+    def _print_setup_instructions(self) -> None:
+        print(
+            "\n  Outlook requires an Azure AD app registration. One-time setup:\n"
+            "\n"
+            "  1. Go to portal.azure.com\n"
+            "  2. Navigate to Azure Active Directory -> App registrations -> New registration\n"
+            "  3. Name your app (e.g. 'Verra'), set account type to\n"
+            "     'Accounts in any organizational directory and personal Microsoft accounts'\n"
+            "  4. Under 'Authentication', add a Mobile/desktop redirect URI:\n"
+            "     https://login.microsoftonline.com/common/oauth2/nativeclient\n"
+            "  5. Under 'API permissions', add Microsoft Graph -> Delegated -> Mail.Read\n"
+            "  6. Copy the Application (client) ID from the Overview page\n"
+            "\n"
+            f"  Then run: verra outlook {self.account} --client-id <your-client-id>\n"
+            "\n"
+            "  The client ID will be saved to config so you only need to pass it once.\n"
+        )
 
     def _graph_get(self, url: str) -> dict[str, Any]:
         """Authenticated GET to Microsoft Graph."""
