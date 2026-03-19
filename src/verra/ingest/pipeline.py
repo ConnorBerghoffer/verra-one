@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -132,177 +133,247 @@ def ingest_folder(
     files_total = len(all_files)
     _emit(None, "scan", f"found {files_total} files")
 
-    for file_path, doc in all_files:
-        stats.files_found += 1
+    # Producer-consumer pattern: CPU-bound steps (classify, time-resolve,
+    # chunk, NER, heuristic analysis) run in parallel across files via a
+    # thread pool.  Serial steps (SQLite writes, embed buffer, dedup) run
+    # on the main thread after collecting each result.
 
-        try:
-            _emit(file_path, "hash", "checking duplicates")
+    def _process_single_file(
+        file_path: Path,
+        doc: Any,
+        content_hash: str,
+    ) -> dict[str, Any]:
+        """CPU-bound work for one file. Returns data needed for serial steps.
 
-            # Deduplication: compute a simple content hash
+        The content_hash is computed and the skip check is done on the main
+        thread before this function is submitted, eliminating any TOCTOU race
+        against the DB.  This function only does pure computation — classify,
+        time-resolve, chunk, NER, heuristic analysis — with no DB access.
+        """
+        # Classify document authority
+        doc_type, authority_weight = classify_document_authority(
+            file_name=file_path.name,
+            file_path=str(file_path),
+            content=doc.content,
+        )
+
+        # Resolve relative time references before chunking
+        doc_date = extract_document_date(doc.content, str(file_path))
+        resolved_content = resolve_time_references(doc.content, doc_date)
+
+        # Chunk (uses no shared state)
+        # Note: document_id is not yet known (requires a DB write), so we
+        # omit it here and patch it in on the main thread after add_document().
+        chunks = chunk_document(
+            resolved_content,
+            metadata={
+                "file_name": file_path.name,
+                "file_path": str(file_path),
+                "format": doc.format,
+                "source_type": "folder",
+                "authority_weight": authority_weight,
+                "document_type": doc_type,
+            },
+        )
+
+        # NER — pure-Python regex, no DB writes
+        entities_per_chunk: list[list[Any]] = []
+        if entity_store is not None:
+            for chunk in chunks:
+                entities_per_chunk.append(extract_entities(chunk.text))
+        else:
+            entities_per_chunk = [[] for _ in chunks]
+
+        # Heuristic analysis — no DB writes
+        analyses: list[Any] = []
+        if analysis_store is not None and analysis_mode == "realtime":
+            for chunk in chunks:
+                analyses.append(analyse_chunk_heuristic(chunk.text))
+        else:
+            analyses = [None] * len(chunks)
+
+        return {
+            "status": "processed",
+            "file_path": file_path,
+            "doc": doc,
+            "content_hash": content_hash,
+            "doc_type": doc_type,
+            "authority_weight": authority_weight,
+            "chunks": chunks,
+            "entities_per_chunk": entities_per_chunk,
+            "analyses": analyses,
+        }
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures: dict[Any, Path] = {}
+        for file_path, doc in all_files:
+            stats.files_found += 1
+
+            # Hash check on the main thread — no TOCTOU race between
+            # concurrent workers seeing "not in DB" and both processing.
             content_hash = _hash_content(doc.content)
-
             if not force_reindex:
                 existing = metadata_store.get_document_by_hash(content_hash)
                 if existing is not None:
                     stats.files_skipped += 1
                     _emit(file_path, "skip", "unchanged")
+                    if progress_callback is not None:
+                        progress_callback(file_path, stats.files_processed, files_total)
                     continue
 
-            _emit(file_path, "extract", f"{len(doc.content):,} chars")
+            fut = pool.submit(_process_single_file, file_path, doc, content_hash)
+            futures[fut] = file_path
 
-            # Classify the document for authority weighting
-            doc_type, authority_weight = classify_document_authority(
-                file_name=file_path.name,
-                file_path=str(file_path),
-                content=doc.content,
-            )
+        for fut in as_completed(futures):
+            file_path = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as exc:
+                stats.errors.append(f"{file_path}: {exc}")
+                stats.files_skipped += 1
+                _emit(file_path, "error", str(exc)[:80])
+                if progress_callback is not None:
+                    progress_callback(file_path, stats.files_processed, files_total)
+                continue
 
-            # Remove old chunks if the file was previously indexed
-            old_doc = metadata_store.get_document_by_path(str(file_path))
-            if old_doc is not None:
-                vector_store.delete_by_document_id(old_doc["id"])
-                metadata_store.delete_document(old_doc["id"])
+            if result["status"] == "skipped":
+                stats.files_skipped += 1
+                _emit(file_path, "skip", "unchanged")
+                if progress_callback is not None:
+                    progress_callback(file_path, stats.files_processed, files_total)
+                continue
 
-            # Register the document in SQLite
-            doc_id = metadata_store.add_document(
-                file_path=str(file_path),
-                file_name=file_path.name,
-                source_type="folder",
-                format=doc.format,
-                content_hash=content_hash,
-                page_count=doc.page_count,
-                extra_metadata=doc.metadata,
-                document_type=doc_type,
-                authority_weight=authority_weight,
-            )
+            # --- Serial section: all DB writes happen on the main thread ---
+            try:
+                doc = result["doc"]
+                content_hash = result["content_hash"]
+                doc_type = result["doc_type"]
+                authority_weight = result["authority_weight"]
+                chunks = result["chunks"]
+                entities_per_chunk = result["entities_per_chunk"]
+                analyses = result["analyses"]
 
-            # Resolve relative time references before chunking so that
-            # phrases like "last quarter" become explicit date ranges in
-            # the embedded text.
-            doc_date = extract_document_date(doc.content, str(file_path))
-            resolved_content = resolve_time_references(doc.content, doc_date)
+                _emit(file_path, "extract", f"{len(doc.content):,} chars")
 
-            _emit(file_path, "chunk", "splitting")
+                # Remove old chunks if the file was previously indexed
+                old_doc = metadata_store.get_document_by_path(str(file_path))
+                if old_doc is not None:
+                    vector_store.delete_by_document_id(old_doc["id"])
+                    metadata_store.delete_document(old_doc["id"])
 
-            # Chunk and index — chunks inherit the document authority weight
-            chunks = chunk_document(
-                resolved_content,
-                metadata={
-                    "document_id": doc_id,
-                    "file_name": file_path.name,
-                    "file_path": str(file_path),
-                    "format": doc.format,
-                    "source_type": "folder",
-                    "authority_weight": authority_weight,
-                    "document_type": doc_type,
-                },
-            )
-
-            _emit(file_path, "chunk", f"{len(chunks)} chunks")
-
-            # Near-duplicate detection: compare new chunks against existing
-            # stored chunk texts before embedding.
-            # Skip dedup when there are too many existing chunks (O(n*m) cost).
-            existing_chunk_texts = metadata_store.get_all_chunk_texts()
-            dup_pairs: list[tuple[int, int, float]] = []
-            if existing_chunk_texts and len(existing_chunk_texts) < 10000:
-                _emit(file_path, "dedup", f"vs {len(existing_chunk_texts)} existing")
-                dup_pairs = find_near_duplicates(chunks, existing_chunk_texts)
-                for new_idx, existing_id, score in dup_pairs:
-                    # Tag the chunk metadata so retrieval can de-rank duplicates.
-                    chunks[new_idx].metadata["near_duplicate_of"] = existing_id
-                    chunks[new_idx].metadata["near_duplicate_score"] = round(score, 4)
-                    stats.near_duplicates_found += 1
-            elif existing_chunk_texts:
-                _emit(file_path, "dedup", f"skipped ({len(existing_chunk_texts)} chunks, too large)")
-
-            chunk_ids = metadata_store.add_chunks(doc_id, chunks, authority_weight=authority_weight)
-
-            # Persist near-duplicate relationships (reuse the pairs we already computed).
-            for new_idx, existing_id, score in dup_pairs:
-                metadata_store.add_near_duplicate(
-                    chunk_id=chunk_ids[new_idx],
-                    near_duplicate_of=existing_id,
-                    similarity_score=score,
+                # Register the document in SQLite (serial — gets the doc_id)
+                doc_id = metadata_store.add_document(
+                    file_path=str(file_path),
+                    file_name=file_path.name,
+                    source_type="folder",
+                    format=doc.format,
+                    content_hash=content_hash,
+                    page_count=doc.page_count,
+                    extra_metadata=doc.metadata,
+                    document_type=doc_type,
+                    authority_weight=authority_weight,
                 )
 
-            # Reference extraction: detect cross-document mentions.
-            _emit(file_path, "refs", "cross-references")
-            for chunk, chunk_id in zip(chunks, chunk_ids):
-                refs = extract_references(chunk.text)
-                if refs:
-                    chunk.metadata["has_references"] = True
-                    stats.references_extracted += len(refs)
-                    resolved = resolve_references(refs, metadata_store)
-                    for ref, res in zip(refs, resolved):
-                        metadata_store.add_chunk_reference(
-                            source_chunk_id=chunk_id,
-                            reference_text=ref["reference_text"],
-                            reference_type=ref["reference_type"],
-                            target_document_id=res.get("resolved_document_id"),
-                            target_chunk_id=None,
-                            confidence=res.get("confidence", 0.5),
-                        )
+                # Patch document_id into each chunk's metadata now that we have it
+                for chunk in chunks:
+                    chunk.metadata["document_id"] = doc_id
 
-            # Accumulate into the embedding buffer; flush when the batch is full.
-            _embed_buffer_ids.extend(chunk_ids)
-            _embed_buffer_chunks.extend(chunks)
-            if len(_embed_buffer_ids) >= EMBED_BATCH_SIZE:
-                _flush_embed_buffer()
+                _emit(file_path, "chunk", f"{len(chunks)} chunks")
 
-            # Entity extraction (if entity store provided)
-            if entity_store is not None:
-                _emit(file_path, "entities", "NER")
+                # Near-duplicate detection (reads + writes — serial)
+                existing_chunk_texts = metadata_store.get_all_chunk_texts()
+                dup_pairs: list[tuple[int, int, float]] = []
+                if existing_chunk_texts and len(existing_chunk_texts) < 10000:
+                    _emit(file_path, "dedup", f"vs {len(existing_chunk_texts)} existing")
+                    dup_pairs = find_near_duplicates(chunks, existing_chunk_texts)
+                    for new_idx, existing_id, score in dup_pairs:
+                        chunks[new_idx].metadata["near_duplicate_of"] = existing_id
+                        chunks[new_idx].metadata["near_duplicate_score"] = round(score, 4)
+                        stats.near_duplicates_found += 1
+                elif existing_chunk_texts:
+                    _emit(file_path, "dedup", f"skipped ({len(existing_chunk_texts)} chunks, too large)")
+
+                chunk_ids = metadata_store.add_chunks(doc_id, chunks, authority_weight=authority_weight)
+
+                # Persist near-duplicate relationships
+                for new_idx, existing_id, score in dup_pairs:
+                    metadata_store.add_near_duplicate(
+                        chunk_id=chunk_ids[new_idx],
+                        near_duplicate_of=existing_id,
+                        similarity_score=score,
+                    )
+
+                # Reference extraction
+                _emit(file_path, "refs", "cross-references")
                 for chunk, chunk_id in zip(chunks, chunk_ids):
-                    extracted = extract_entities(chunk.text)
-                    if extracted:
-                        entity_ids = resolve_entities_to_registry(extracted, entity_store)
-                        entity_store.link_chunk_batch(chunk_id, entity_ids)
-                        stats.entities_found += len(entity_ids)
+                    refs = extract_references(chunk.text)
+                    if refs:
+                        chunk.metadata["has_references"] = True
+                        stats.references_extracted += len(refs)
+                        resolved = resolve_references(refs, metadata_store)
+                        for ref, res in zip(refs, resolved):
+                            metadata_store.add_chunk_reference(
+                                source_chunk_id=chunk_id,
+                                reference_text=ref["reference_text"],
+                                reference_type=ref["reference_type"],
+                                target_document_id=res.get("resolved_document_id"),
+                                target_chunk_id=None,
+                                confidence=res.get("confidence", 0.5),
+                            )
 
-                        # Extract relationships from co-occurring entities
-                        rels = extract_relationships(entity_ids, entity_store, source_chunk_id=chunk_id)
-                        for ea, rtype, eb in rels:
-                            entity_store.add_relationship(ea, rtype, eb, source_chunk_id=chunk_id)
-                        stats.relationships_found += len(rels)
+                # Accumulate into the embedding buffer; flush when full
+                _embed_buffer_ids.extend(chunk_ids)
+                _embed_buffer_chunks.extend(chunks)
+                if len(_embed_buffer_ids) >= EMBED_BATCH_SIZE:
+                    _flush_embed_buffer()
 
-            # Chunk analysis (if analysis store provided)
-            if analysis_store is not None:
-                _emit(file_path, "analyse", f"{analysis_mode}")
-                for chunk, chunk_id in zip(chunks, chunk_ids):
-                    if analysis_mode == "fast":
-                        # Just mark as pending for later deep analysis
-                        analysis_store.set_chunk_status(chunk_id, "pending")
-                    elif analysis_mode == "realtime":
-                        # Run heuristic analysis inline (fast, no LLM)
-                        analysis = analyse_chunk_heuristic(chunk.text)
-                        # Collect entity IDs for this chunk
-                        chunk_entity_ids = []
-                        if entity_store is not None:
-                            chunk_ents = entity_store.get_entities_for_chunk(chunk_id)
-                            chunk_entity_ids = [e["id"] for e in chunk_ents]
-                        process_analysis_results(
-                            chunk_id=chunk_id,
-                            analysis=analysis,
-                            analysis_store=analysis_store,
-                            entity_store=entity_store,
-                            entity_ids=chunk_entity_ids,
-                        )
-                        stats.chunks_analysed += 1
-                        stats.commitments_found += len(analysis.commitments or [])
+                # Entity writes — NER was done in the thread; persist results here
+                if entity_store is not None:
+                    _emit(file_path, "entities", "NER")
+                    for chunk, chunk_id, extracted in zip(chunks, chunk_ids, entities_per_chunk):
+                        if extracted:
+                            entity_ids = resolve_entities_to_registry(extracted, entity_store)
+                            entity_store.link_chunk_batch(chunk_id, entity_ids)
+                            stats.entities_found += len(entity_ids)
 
-            stats.files_processed += 1
-            stats.chunks_created += len(chunks)
-            _emit(file_path, "done", f"{len(chunks)} chunks, {stats.entities_found} entities total")
+                            rels = extract_relationships(entity_ids, entity_store, source_chunk_id=chunk_id)
+                            for ea, rtype, eb in rels:
+                                entity_store.add_relationship(ea, rtype, eb, source_chunk_id=chunk_id)
+                            stats.relationships_found += len(rels)
 
-        except Exception as exc:
-            stats.errors.append(f"{file_path}: {exc}")
-            stats.files_skipped += 1
-            _emit(file_path, "error", str(exc)[:80])
+                # Analysis writes — heuristic analysis was done in thread; persist here
+                if analysis_store is not None:
+                    _emit(file_path, "analyse", f"{analysis_mode}")
+                    for chunk, chunk_id, analysis in zip(chunks, chunk_ids, analyses):
+                        if analysis_mode == "fast":
+                            analysis_store.set_chunk_status(chunk_id, "pending")
+                        elif analysis_mode == "realtime" and analysis is not None:
+                            chunk_entity_ids: list[Any] = []
+                            if entity_store is not None:
+                                chunk_ents = entity_store.get_entities_for_chunk(chunk_id)
+                                chunk_entity_ids = [e["id"] for e in chunk_ents]
+                            process_analysis_results(
+                                chunk_id=chunk_id,
+                                analysis=analysis,
+                                analysis_store=analysis_store,
+                                entity_store=entity_store,
+                                entity_ids=chunk_entity_ids,
+                            )
+                            stats.chunks_analysed += 1
+                            stats.commitments_found += len(analysis.commitments or [])
 
-        finally:
-            if progress_callback is not None:
-                progress_callback(file_path, stats.files_processed, files_total)
+                stats.files_processed += 1
+                stats.chunks_created += len(chunks)
+                _emit(file_path, "done", f"{len(chunks)} chunks, {stats.entities_found} entities total")
+
+            except Exception as exc:
+                stats.errors.append(f"{file_path}: {exc}")
+                stats.files_skipped += 1
+                _emit(file_path, "error", str(exc)[:80])
+
+            finally:
+                if progress_callback is not None:
+                    progress_callback(file_path, stats.files_processed, files_total)
 
     # Flush any remaining chunks that did not fill a complete batch.
     _flush_embed_buffer()

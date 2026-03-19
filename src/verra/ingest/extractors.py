@@ -270,15 +270,24 @@ def extract_text(path: Path) -> ExtractedDocument:
     )
 
 
-def extract_csv(path: Path) -> ExtractedDocument:
+def extract_csv(path: Path, max_rows: int = 500) -> ExtractedDocument:
     """Convert a CSV to a readable text representation.
 
     For large CSVs (>100 rows), splits into logical sections with headers
     repeated so chunks stay self-contained.
+
+    Parameters
+    ----------
+    max_rows:
+        Maximum number of data rows to include.  When a CSV exceeds this
+        limit only the first ``max_rows`` rows are extracted and a
+        truncation note is appended.  Default is 500, which prevents
+        100K-row CSVs from creating thousands of chunks.
     """
     text_rows: list[str] = []
     header: str = ""
-    row_count = 0
+    total_rows = 0        # all non-empty rows including header (preserves old row_count semantics)
+    total_data_rows = 0   # data rows only (excluding header)
 
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
@@ -288,26 +297,46 @@ def extract_csv(path: Path) -> ExtractedDocument:
                 continue
             if i == 0:
                 header = line
-            text_rows.append(line)
-            row_count += 1
+                text_rows.append(line)
+                total_rows += 1
+                continue
+            # Count all data rows to report an accurate total, but only
+            # include up to max_rows in the extracted content.
+            total_data_rows += 1
+            total_rows += 1
+            if total_data_rows <= max_rows:
+                text_rows.append(line)
+
+    truncated = total_data_rows > max_rows
+    remaining = total_data_rows - max_rows
+    rows_in_content = len(text_rows) - 1  # data rows actually included (excludes header)
 
     # For large CSVs, split into sections with header context
-    if row_count > 100:
+    if rows_in_content > 100:
         sections: list[str] = []
         chunk_size = 50
         data_rows = text_rows[1:]  # skip header
         for start in range(0, len(data_rows), chunk_size):
             batch = data_rows[start : start + chunk_size]
             section = f"{header}\n" + "\n".join(batch)
-            section += f"\n\n[Rows {start + 1}-{start + len(batch)} of {len(data_rows)}]"
+            section += f"\n\n[Rows {start + 1}-{start + len(batch)} of {total_data_rows}]"
             sections.append(section)
         content = "\n\n---\n\n".join(sections)
     else:
         content = "\n".join(text_rows)
 
+    if truncated:
+        content += f"\n\n[... {remaining:,} more rows truncated (showing first {max_rows} of {total_data_rows:,} total)]"
+
     return ExtractedDocument(
         content=content,
-        metadata={"file_path": str(path), "file_name": path.name, "row_count": row_count},
+        metadata={
+            "file_path": str(path),
+            "file_name": path.name,
+            "row_count": total_rows,          # total non-empty rows (header + data), backward-compatible
+            "rows_extracted": rows_in_content, # data rows actually in content
+            "rows_truncated": truncated,
+        },
         format="csv",
         page_count=1,
     )
