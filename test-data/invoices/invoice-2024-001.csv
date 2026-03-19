@@ -1,0 +1,11 @@
+Invoice Number,Client,Contact,Amount,Currency,Date Issued,Due Date,Status,Description
+INV-2024-001,Acme Corporation,John Smith,12500.00,AUD,2024-01-01,2024-01-31,Paid,Monthly retainer - January 2024
+INV-2024-002,Acme Corporation,John Smith,12500.00,AUD,2024-02-01,2024-03-02,Paid,Monthly retainer - February 2024
+INV-2024-003,Acme Corporation,John Smith,15125.00,AUD,2024-03-01,2024-03-31,Paid,Monthly retainer + 15 additional hours
+INV-2024-004,Acme Corporation,John Smith,12500.00,AUD,2024-04-01,2024-04-30,Paid,Monthly retainer - April 2024
+INV-2024-005,Acme Corporation,John Smith,12500.00,AUD,2024-05-01,2024-05-31,Overdue,Monthly retainer - May 2024
+INV-2024-006,Acme Corporation,John Smith,12500.00,AUD,2024-06-01,2024-06-30,Overdue,Monthly retainer - June 2024
+INV-2024-007,TechCo Solutions,Lisa Park,22500.00,AUD,2024-03-25,2024-04-24,Paid,Phase 1 - 50% upfront
+INV-2024-008,TechCo Solutions,Lisa Park,22500.00,AUD,2024-04-22,2024-05-22,Paid,Phase 1 - 50% completion
+INV-2024-009,TechCo Solutions,Lisa Park,90000.00,AUD,2024-04-29,2024-05-29,Pending,Phase 2 - 50% upfront
+INV-2024-010,GlobalRetail Inc,Sarah Chen,8500.00,AUD,2024-05-15,2024-06-14,Paid,Consulting - Infrastructure Audit

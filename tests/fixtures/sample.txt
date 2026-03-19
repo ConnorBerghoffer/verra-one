@@ -1,0 +1,16 @@
+Meeting Notes — Q1 Planning Session
+Date: January 15, 2024
+Attendees: Alice, Bob, Carol
+
+Key decisions:
+1. Launch the new onboarding flow by February 1st.
+2. Hire two additional engineers in Q1.
+3. Increase marketing budget by 15% for the quarter.
+4. Schedule weekly standups every Monday at 9am.
+
+Action items:
+- Alice: Draft the onboarding spec by January 22nd.
+- Bob: Post job listings on LinkedIn and Hacker News.
+- Carol: Prepare the marketing budget proposal.
+
+Next meeting: January 29, 2024.

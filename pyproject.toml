@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "verra-one"
+version = "0.1.0"
+description = "Chat with your business data — emails, docs, spreadsheets."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    {name = "Connor Berghoffer"},
+]
+keywords = ["ai", "rag", "business", "email", "documents", "search", "llm", "agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing :: Indexing",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pypdf>=4.0,<5.0",
+    "python-docx>=1.1,<2.0",
+    "tiktoken>=0.9,<1.0",
+    "chromadb>=1.0,<2.0",
+    "litellm>=1.60,<2.0",
+    "google-auth-oauthlib>=1.2,<2.0",
+    "google-api-python-client>=2.160,<3.0",
+    "pydantic>=2.10,<3.0",
+    "pyyaml>=6.0,<7.0",
+    "click>=8.1,<9.0",
+    "prompt-toolkit>=3.0,<4.0",
+    "watchdog>=6.0,<7.0",
+    "fabric>=3.2,<4.0",
+    "rich>=13.9,<14.0",
+    "openpyxl>=3.1.5,<4.0",
+    "msal>=1.28,<2.0",
+    "fastapi>=0.115,<1.0",
+    "uvicorn>=0.34,<1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/connorberghoffer/verra-one"
+Repository = "https://github.com/connorberghoffer/verra-one"
+Issues = "https://github.com/connorberghoffer/verra-one/issues"
+
+[project.scripts]
+verra = "verra.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/verra"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "test-data/", "pyproject.toml", "README.md"]
+
+[project.optional-dependencies]
+pymupdf = ["pymupdf>=1.25,<2.0"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pip-audit>=2.7",
+]

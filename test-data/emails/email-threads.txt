@@ -1,0 +1,201 @@
+From: connor@berghofferdigital.com
+To: john.smith@acmecorp.com
+Date: 2024-05-10
+Subject: Outstanding Invoices - Acme Corp
+
+Hi John,
+
+Hope you're doing well. I wanted to follow up on invoices INV-2024-005 and INV-2024-006 which are currently overdue. The combined total is $25,000.
+
+Could you let me know the status of these payments? Happy to discuss if there are any issues on your end.
+
+Best,
+Connor
+
+---
+
+From: john.smith@acmecorp.com
+To: connor@berghofferdigital.com
+Date: 2024-05-12
+Subject: Re: Outstanding Invoices - Acme Corp
+
+Hi Connor,
+
+Apologies for the delay. We had a restructuring in our finance team and some invoices fell through the cracks. I've escalated both to our new CFO, Rachel Torres. She should have them processed by end of next week.
+
+On a separate note — we're really happy with the monitoring dashboard Marcus set up. The team loves it. Would love to discuss expanding our engagement to include application performance monitoring as well. Can we set up a call?
+
+Cheers,
+John
+
+---
+
+From: connor@berghofferdigital.com
+To: john.smith@acmecorp.com
+Date: 2024-05-13
+Subject: Re: Re: Outstanding Invoices - Acme Corp
+
+Thanks John, appreciate you chasing that up.
+
+Great to hear about the dashboard! Happy to discuss APM — I think we could add New Relic or Datadog APM integration to your stack for around $3,500/month additional. Let me put together a quick scope document.
+
+How's Thursday at 2pm for a call?
+
+Connor
+
+---
+
+From: john.smith@acmecorp.com
+To: connor@berghofferdigital.com
+Date: 2024-05-13
+Subject: Re: Re: Re: Outstanding Invoices - Acme Corp
+
+Thursday 2pm works. Send me a calendar invite.
+
+And Rachel confirmed the payments will be processed by Friday May 17.
+
+John
+
+===
+
+From: connor@berghofferdigital.com
+To: lisa.park@techco.io
+Date: 2024-03-08
+Subject: TechCo Migration Proposal
+
+Hi Lisa,
+
+Great chatting with you at the Melbourne Tech Meetup last week. As discussed, I've put together a proposal for the PHP-to-microservices migration.
+
+Please find the proposal attached (also available at our shared Drive link). The key highlights:
+- 24-week timeline across 3 phases
+- Total investment: $345,000
+- Phase 1 starts at $45,000 for a 4-week assessment
+
+Happy to schedule a technical deep-dive call to walk through the details. How does the week of March 11 look for you?
+
+Best regards,
+Connor Berghoffer
+CEO, Berghoffer Digital
+
+---
+
+From: lisa.park@techco.io
+To: connor@berghofferdigital.com
+Date: 2024-03-11
+Subject: Re: TechCo Migration Proposal
+
+Hi Connor,
+
+Thanks for sending this over. The proposal looks comprehensive and the phased approach makes sense for us. A few questions:
+
+1. Can we get a fixed-price option for Phase 1 instead of T&M?
+2. What happens if the assessment reveals the migration is more complex than expected?
+3. Do you have experience with PCI-DSS compliance? We process payments and need to maintain compliance during migration.
+
+Let's do Thursday March 14 at 10am for the deep-dive?
+
+Lisa
+
+---
+
+From: connor@berghofferdigital.com
+To: lisa.park@techco.io
+Date: 2024-03-12
+Subject: Re: Re: TechCo Migration Proposal
+
+Hi Lisa,
+
+Great questions:
+
+1. Phase 1 is already fixed-price at $45,000. We absorb any overruns on the assessment.
+2. If scope increases significantly, we'd revise Phase 2/3 pricing before proceeding. No surprises.
+3. Yes — we helped GlobalRetail maintain PCI-DSS compliance during their migration last year. Marcus (our lead) has specific PCI experience.
+
+Thursday 10am works perfectly. I'll send a calendar invite with a Google Meet link.
+
+Connor
+
+===
+
+From: connor@berghofferdigital.com
+To: sarah.chen@globalretail.com
+Date: 2023-09-15
+Subject: Infrastructure Audit Results - GlobalRetail
+
+Hi Sarah,
+
+Please find attached the infrastructure audit report for GlobalRetail. Key findings:
+
+1. Your AWS spend can be reduced by approximately 35% ($4,200/month) through right-sizing and reserved instances
+2. The database replication lag is causing intermittent checkout failures — we recommend upgrading to Aurora
+3. Your CDN configuration is suboptimal — CloudFront cache hit ratio is only 42% (should be 85%+)
+4. SSL certificates on 3 subdomains expire in 45 days — needs immediate attention
+
+Recommended next steps:
+- Schedule a 2-hour working session to implement the quick wins (reserved instances, CDN config)
+- Plan the Aurora migration for Q4
+- Renew SSL certs this week
+
+Let me know how you'd like to proceed.
+
+Best,
+Connor
+
+===
+
+From: jake.mitchell@novastartup.com
+To: connor@berghofferdigital.com
+Date: 2023-09-01
+Subject: DevOps Consulting Inquiry
+
+Hi Connor,
+
+I'm the CTO of Nova Startup. We just raised our Series A ($8M) and need to scale our infrastructure. Currently running on a single Heroku dyno and things are starting to break under load.
+
+We need help with:
+- Migrating from Heroku to AWS
+- Setting up proper CI/CD
+- Implementing monitoring and alerting
+- Auto-scaling for our API
+
+Our tech stack is Python (FastAPI) + React + PostgreSQL.
+
+Would you be available for an initial consultation? Budget is flexible but we'd like to understand ballpark costs.
+
+Jake Mitchell
+CTO, Nova Startup
+
+---
+
+From: connor@berghofferdigital.com
+To: jake.mitchell@novastartup.com
+Date: 2023-09-03
+Subject: Re: DevOps Consulting Inquiry
+
+Hi Jake,
+
+Congrats on the Series A! Happy to help with the infrastructure scaling.
+
+Based on what you've described, I'd estimate:
+- Initial migration + setup: $25,000-35,000 (4-6 weeks)
+- Ongoing managed infrastructure: $5,000-8,000/month
+
+I'd suggest we start with a 2-hour discovery call ($500, credited toward the project if you proceed) to understand your current setup and traffic patterns in detail.
+
+Are you free next Tuesday or Wednesday afternoon?
+
+Connor
+
+---
+
+From: jake.mitchell@novastartup.com
+To: connor@berghofferdigital.com
+Date: 2023-09-05
+Subject: Re: Re: DevOps Consulting Inquiry
+
+Wednesday 3pm works. Send me a Meet link.
+
+Quick question — do you have experience with FastAPI specifically? Our API has some custom middleware for rate limiting and auth that's tightly coupled to the framework.
+
+Jake

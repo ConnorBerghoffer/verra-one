@@ -1,0 +1,107 @@
+# .atlasignore — Atlas ignore file
+#
+# Copy this file to ~/.atlas/.atlasignore (global) or place it as
+# .atlasignore inside any folder you ingest (local overrides).
+#
+# Format: one gitignore-style glob pattern per line.
+# Lines starting with # are comments.  Blank lines are ignored.
+#
+# These patterns are layered on top of Atlas's built-in default ignore list
+# (system files, media files, and common credential file patterns are always
+# excluded regardless of this file).
+#
+# ----------------------------------------------------------------------------
+# Credential & secret files
+# ----------------------------------------------------------------------------
+
+*.key
+*.pem
+*.crt
+*.pfx
+*secret*
+*credential*
+*password*
+.env
+.env.*
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# ----------------------------------------------------------------------------
+# Version control / build artefacts
+# ----------------------------------------------------------------------------
+
+.git/
+.svn/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.o
+*.a
+
+# ----------------------------------------------------------------------------
+# System / OS files
+# ----------------------------------------------------------------------------
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ----------------------------------------------------------------------------
+# Large archive / binary formats (non-extractable)
+# ----------------------------------------------------------------------------
+
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z
+*.exe
+*.dll
+*.so
+*.dylib
+*.dmg
+*.iso
+*.img
+
+# ----------------------------------------------------------------------------
+# Media files (no useful text content)
+# ----------------------------------------------------------------------------
+
+*.mp3
+*.mp4
+*.wav
+*.ogg
+*.flac
+*.avi
+*.mov
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.svg
+*.ico
+*.tiff
+*.webp
+
+# ----------------------------------------------------------------------------
+# Project-specific examples (uncomment or adapt as needed)
+# ----------------------------------------------------------------------------
+
+# Ignore a specific vendor directory
+# vendor/
+
+# Ignore all log files
+# *.log
+
+# Ignore compiled Python bytecode (already in defaults, shown here as example)
+# *.pyc
