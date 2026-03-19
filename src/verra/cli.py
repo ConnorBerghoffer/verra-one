@@ -1018,10 +1018,11 @@ def ingest(folder_path: Path, force: bool, mode: str, dry_run: bool) -> None:
         console.print()
         return
 
-    from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
+    from rich.live import Live
+    from rich.text import Text as RichText
 
     from verra.config import VERRA_HOME, ensure_data_dir, load_config
-    from verra.ingest.pipeline import ingest_folder
+    from verra.ingest.pipeline import IngestPhase, ingest_folder
     from verra.store.analysis import AnalysisStore
     from verra.store.db import DatabaseManager
     from verra.store.entities import EntityStore
@@ -1043,22 +1044,137 @@ def ingest(folder_path: Path, force: bool, mode: str, dry_run: bool) -> None:
     analysis_store = AnalysisStore.from_connection(db.analysis)
     vector_store = VectorStore(VERRA_HOME / "chroma")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[dim]{task.description}[/dim]"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Ingesting", total=None)
+    # -- live state for the renderer --
+    _live_state: dict[str, Any] = {
+        "phase": "scan",
+        "file": "",
+        "detail": "",
+        "files_done": 0,
+        "files_total": 0,
+        "chunks": 0,
+        "entities": 0,
+        "errors": 0,
+        "t0": time.time(),
+        "file_times": [],      # seconds-per-file ring buffer for ETA
+    }
+    _last_file_t = [time.time()]
 
-        def on_progress(file_path: Path, current: int, total: int) -> None:
-            progress.update(
-                task,
-                total=total if total >= 0 else None,
-                completed=current,
-                description=f"[dim]{file_path.name}[/dim]",
-            )
+    def _fmt_eta(seconds: float) -> str:
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            m, s = divmod(int(seconds), 60)
+            return f"{m}m {s:02d}s"
+        else:
+            h, rem = divmod(int(seconds), 3600)
+            m = rem // 60
+            return f"{h}h {m:02d}m"
+
+    def _render() -> RichText:
+        s = _live_state
+        done = s["files_done"]
+        total = s["files_total"]
+        elapsed = time.time() - s["t0"]
+
+        lines: list[str] = []
+
+        # Line 1: progress bar
+        if total > 0:
+            pct = done / total
+            bar_w = 30
+            filled = int(pct * bar_w)
+            bar = "━" * filled + "[dim]" + "━" * (bar_w - filled) + "[/dim]"
+            pct_str = f"{pct * 100:5.1f}%"
+
+            # ETA from rolling average
+            times = s["file_times"]
+            if len(times) >= 3 and done < total:
+                avg = sum(times[-20:]) / len(times[-20:])
+                eta = avg * (total - done)
+                eta_str = f"~{_fmt_eta(eta)} left"
+            elif done >= total:
+                eta_str = "done"
+            else:
+                eta_str = "estimating..."
+
+            lines.append(f"  {bar} {pct_str}  [dim]{done}[/dim]/{total} files  [dim]{eta_str}[/dim]")
+        else:
+            lines.append(f"  [dim]scanning...[/dim]")
+
+        # Line 2: current file + what we're doing to it
+        phase_labels = {
+            "scan": "scanning",
+            "hash": "hashing",
+            "skip": "skipped",
+            "extract": "reading",
+            "chunk": "chunking",
+            "dedup": "dedup",
+            "refs": "references",
+            "embed": "embedding",
+            "entities": "extracting entities",
+            "analyse": "analysing",
+            "done": "done",
+            "error": "error",
+        }
+        fname = s["file"]
+        if len(fname) > 45:
+            fname = "..." + fname[-42:]
+        phase_label = phase_labels.get(s["phase"], s["phase"])
+        detail = s["detail"]
+        if s["phase"] == "error":
+            lines.append(f"  [red]>[/red] {fname}  [red]{phase_label}[/red]  [dim]{detail}[/dim]")
+        elif s["phase"] == "skip":
+            lines.append(f"  [dim]> {fname}  {phase_label}[/dim]")
+        elif s["phase"] == "done":
+            lines.append(f"  [green]>[/green] {fname}  [dim]{detail}[/dim]")
+        else:
+            lines.append(f"  [cyan]>[/cyan] {fname}  [dim]{phase_label}[/dim]  [dim]{detail}[/dim]")
+
+        # Line 3: running counters
+        elapsed_str = _fmt_eta(elapsed)
+        chunks = s["chunks"]
+        ents = s["entities"]
+        errs = s["errors"]
+
+        parts = [f"[dim]{elapsed_str} elapsed[/dim]"]
+        parts.append(f"[dim]{chunks:,} chunks[/dim]")
+        parts.append(f"[dim]{ents:,} entities[/dim]")
+        if errs > 0:
+            parts.append(f"[yellow]{errs} errors[/yellow]")
+        lines.append("  " + "  ".join(parts))
+
+        return console.render_str("\n".join(lines))
+
+    def on_phase(phase: IngestPhase) -> None:
+        now = time.time()
+        s = _live_state
+        s["phase"] = phase.phase
+        s["file"] = phase.file_path.name if phase.file_path else ""
+        s["detail"] = phase.detail
+        s["files_done"] = phase.files_done
+        s["files_total"] = phase.files_total
+        s["chunks"] = phase.chunks_so_far
+        s["entities"] = phase.entities_so_far
+        s["errors"] = phase.errors_so_far
+
+        # Track per-file time for ETA (record on each "done" or "skip")
+        if phase.phase in ("done", "skip"):
+            dt = now - _last_file_t[0]
+            if dt > 0.001:  # ignore sub-ms noise
+                s["file_times"].append(dt)
+                # Keep last 50 for rolling average
+                if len(s["file_times"]) > 50:
+                    s["file_times"] = s["file_times"][-50:]
+            _last_file_t[0] = now
+
+    def on_progress(file_path: Path, current: int, total: int) -> None:
+        pass  # phase_callback handles everything
+
+    with Live(_render(), console=console, refresh_per_second=8) as live:
+
+        def on_phase_with_render(phase: IngestPhase) -> None:
+            on_phase(phase)
+            live.update(_render())
 
         stats = ingest_folder(
             folder_path=folder_path,
@@ -1069,29 +1185,29 @@ def ingest(folder_path: Path, force: bool, mode: str, dry_run: bool) -> None:
             analysis_mode=mode,
             force_reindex=force,
             progress_callback=on_progress,
+            phase_callback=on_phase_with_render,
         )
 
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column("", style="dim")
-    table.add_column("", justify="right")
-    table.add_row("Files found", str(stats.files_found))
-    table.add_row("Files processed", str(stats.files_processed))
-    table.add_row("Skipped (unchanged)", str(stats.files_skipped))
-    table.add_row("Chunks created", str(stats.chunks_created))
-    table.add_row("Entities found", str(stats.entities_found))
-    table.add_row("Relationships", str(stats.relationships_found))
-    table.add_row("Chunks analysed", str(stats.chunks_analysed))
-    table.add_row("Total vectors", str(vector_store.count()))
-    table.add_row("Time elapsed", f"{stats.elapsed_seconds:.1f}s")
+    # Final summary
+    console.print()
+    elapsed_str = _fmt_eta(stats.elapsed_seconds)
+    console.print(f"  [bold green]Ingestion complete.[/bold green]  {elapsed_str}")
+    console.print()
 
-    console.print(table)
+    console.print(f"  [dim]files[/dim]      {stats.files_processed} processed, {stats.files_skipped} skipped")
+    console.print(f"  [dim]chunks[/dim]     {stats.chunks_created:,}")
+    console.print(f"  [dim]vectors[/dim]    {vector_store.count():,}")
+    console.print(f"  [dim]entities[/dim]   {stats.entities_found:,}")
+    console.print(f"  [dim]relations[/dim]  {stats.relationships_found:,}")
 
     if stats.errors:
-        console.print(f"\n  [yellow]Warnings ({len(stats.errors)}):[/yellow]")
-        for err in stats.errors[:10]:
-            console.print(f"    [dim]{err}[/dim]")
-        if len(stats.errors) > 10:
-            console.print(f"    [dim]... and {len(stats.errors) - 10} more[/dim]")
+        console.print()
+        console.print(f"  [yellow]{len(stats.errors)} warnings:[/yellow]")
+        for err in stats.errors[:5]:
+            short = err if len(err) < 80 else err[:77] + "..."
+            console.print(f"    [dim]{short}[/dim]")
+        if len(stats.errors) > 5:
+            console.print(f"    [dim]... and {len(stats.errors) - 5} more[/dim]")
 
     console.print()
     db.close()
