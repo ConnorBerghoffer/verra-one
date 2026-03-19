@@ -186,6 +186,15 @@ CREATE TABLE IF NOT EXISTS sync_state (
     items_processed  INTEGER NOT NULL DEFAULT 0,
     status           TEXT    NOT NULL DEFAULT 'idle'
 );
+
+-- FTS5 virtual table for BM25 full-text search across chunk text.
+-- We store text directly here (not a content table) because the text
+-- lives in the JSON metadata blob, not a plain text column in chunks.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    chunk_id UNINDEXED,
+    text,
+    tokenize = 'porter ascii'
+);
 """
 
 
@@ -318,6 +327,73 @@ class MetadataStore:
             ids.append(cur.lastrowid)  # type: ignore[arg-type]
         self._conn.commit()
         return ids
+
+    def index_chunk_text(self, chunk_id: int, text: str) -> None:
+        """Insert or replace a chunk's text in the FTS5 index.
+
+        Called at ingest time after the chunk is stored in ChromaDB so that
+        the same text is searchable via BM25 without a round-trip to the
+        vector store.
+        """
+        # DELETE + INSERT pattern for upsert on FTS5 tables (no ON CONFLICT support)
+        self._conn.execute(
+            "DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk_id,)
+        )
+        self._conn.execute(
+            "INSERT INTO chunks_fts (chunk_id, text) VALUES (?, ?)",
+            (chunk_id, text),
+        )
+        self._conn.commit()
+
+    def search_fts(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """BM25 full-text search across chunk text via SQLite FTS5.
+
+        Returns a list of dicts with keys: chunk_id, snippet, rank.
+        Results are ordered by BM25 rank (most relevant first).
+        """
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    chunk_id,
+                    snippet(chunks_fts, 1, '', '', '...', 32) AS snippet,
+                    rank
+                FROM chunks_fts
+                WHERE text MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (query, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception:
+            # FTS5 MATCH can raise if the query string is malformed; degrade gracefully.
+            return []
+
+    def ensure_fts_populated(self) -> int:
+        """Backfill the FTS5 index from the metadata JSON blob in the chunks table.
+
+        Should be called once after an upgrade to populate an existing database.
+        Skips chunks that are already indexed.  Returns the number of newly
+        indexed chunks.
+        """
+        already: set[int] = {
+            row[0]
+            for row in self._conn.execute("SELECT chunk_id FROM chunks_fts").fetchall()
+        }
+        pairs = self.get_all_chunk_texts()
+        count = 0
+        for chunk_id, text in pairs:
+            if chunk_id in already:
+                continue
+            self._conn.execute(
+                "INSERT INTO chunks_fts (chunk_id, text) VALUES (?, ?)",
+                (chunk_id, text),
+            )
+            count += 1
+        if count:
+            self._conn.commit()
+        return count
 
     def get_chunk(self, chunk_id: int) -> dict[str, Any] | None:
         row = self._conn.execute(

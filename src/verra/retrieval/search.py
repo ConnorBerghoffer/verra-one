@@ -22,6 +22,64 @@ from verra.retrieval.router import ClassifiedQuery, QueryType
 from verra.store.metadata import MetadataStore
 from verra.store.vector import VectorStore
 
+# ---------------------------------------------------------------------------
+# Cross-encoder reranker (lazy-loaded on first use)
+# ---------------------------------------------------------------------------
+
+_reranker: Any = None  # CrossEncoder instance, False if unavailable, None if not yet loaded
+
+
+def _get_reranker() -> Any:
+    """Lazy-load the cross-encoder reranker.
+
+    Returns a CrossEncoder instance, or None if sentence-transformers is not
+    installed.  The result is cached so the model is only loaded once per
+    process.
+    """
+    global _reranker
+    if _reranker is None:
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore[import]
+            _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        except Exception:
+            _reranker = False  # sentinel: unavailable
+    return _reranker if _reranker is not False else None
+
+
+def rerank(query: str, results: list[SearchResult], top_n: int) -> list[SearchResult]:
+    """Rerank results using a cross-encoder for better precision.
+
+    The cross-encoder scores each (query, passage) pair independently, giving
+    much more accurate relevance judgements than bi-encoder similarity alone.
+    Falls back to input order if the model is unavailable.
+
+    Raw cross-encoder logits (ms-marco-MiniLM) use a different scale than
+    ChromaDB similarity scores — they can be very negative for irrelevant
+    passages and highly positive for strong matches.  We normalise them to
+    [0, 1] within the result set so downstream thresholds (e.g. _MIN_SCORE
+    in chat.py) continue to work correctly.
+    """
+    ranker = _get_reranker()
+    if ranker is None or not results:
+        return results[:top_n]
+
+    pairs = [(query, r.text) for r in results]
+    raw_scores = ranker.predict(pairs)
+
+    # Normalise logits to [0, 1] within this candidate set
+    s_min = float(min(raw_scores))
+    s_max = float(max(raw_scores))
+    s_range = s_max - s_min
+
+    for r, raw in zip(results, raw_scores):
+        if s_range > 1e-9:
+            r.score = (float(raw) - s_min) / s_range
+        else:
+            r.score = 1.0  # all identical
+
+    results.sort(key=lambda r: r.score, reverse=True)
+    return results[:top_n]
+
 
 @dataclass
 class SearchResult:
@@ -98,13 +156,9 @@ def search(
     if query.query_type == QueryType.METADATA:
         return _metadata_search(query, metadata_store, n_results)
     elif query.query_type == QueryType.SEMANTIC:
+        # Gather candidates from all retrieval strategies.
+        # _semantic_search returns a larger candidate set without final reranking.
         embedding_results = _semantic_search(query, vector_store, n_results)
-
-        # Reserve top embedding hits — these should always appear in the
-        # final results since the embedding model captured genuine semantic
-        # relevance that keyword matching can miss.
-        reserved = embedding_results[:3]
-        rest = embedding_results[3:]
 
         # Supplement with keyword search — catches specific names, acronyms
         keyword_hits = _keyword_fallback(query, vector_store, n_results)
@@ -113,25 +167,27 @@ def search(
         # include it. Catches "PTO" → pto_log_2025.csv etc.
         fname_hits = _filename_search(query, vector_store, n_results=3)
 
-        # Merge: reserved embedding hits first, then fill from all pools.
-        # Keyword/filename scores are on a different scale (0-1 vs embedding
-        # scores which can be negative), so cap supplemental scores to not
-        # outrank the top embedding hits.
-        existing_ids = {r.chunk_id for r in reserved}
-        if reserved:
-            max_reserved_score = max(r.score for r in reserved)
-        else:
-            max_reserved_score = 0.5
-        pool = rest + keyword_hits + fname_hits
-        for r in pool:
-            if r.chunk_id not in existing_ids:
-                # Cap supplemental scores just below the best embedding hit
-                # so they enrich but don't override semantic relevance.
-                r.score = min(r.score, max_reserved_score - 0.01)
-                reserved.append(r)
-                existing_ids.add(r.chunk_id)
+        # BM25 full-text search from SQLite FTS5
+        bm25_hits = _bm25_search(query, metadata_store, vector_store, n_results)
 
-        results = rank_by_authority(reserved)[:n_results]
+        # Merge all candidate pools, deduplicate by chunk_id.
+        # Embedding results go first so their diversity-filtered ordering
+        # acts as a tiebreaker when scores are equal before reranking.
+        merged: list[SearchResult] = []
+        seen_ids: set[str] = set()
+        for r in embedding_results + bm25_hits + keyword_hits + fname_hits:
+            if r.chunk_id not in seen_ids:
+                merged.append(r)
+                seen_ids.add(r.chunk_id)
+
+        # Cross-encoder reranking adjudicates between all retrieval strategies.
+        # We pass up to 4x n_results candidates to give the reranker enough
+        # material to work with while keeping inference time reasonable.
+        rerank_n = n_results * 4
+        reranked = rerank(query.semantic_text, merged, rerank_n)
+
+        # Authority ranking as a final tiebreaker among close reranker scores
+        results = rank_by_authority(reranked)[:n_results]
         return results
     else:
         return _hybrid_search(query, metadata_store, vector_store, n_results)
@@ -327,12 +383,81 @@ def _metadata_search(
     return rank_by_authority(results)
 
 
+def _bm25_search(
+    query: ClassifiedQuery,
+    metadata_store: MetadataStore,
+    vector_store: VectorStore,
+    n_results: int,
+) -> list[SearchResult]:
+    """BM25 full-text search via SQLite FTS5.
+
+    Uses the MetadataStore FTS5 index to find chunks matching the query.
+    Enriches each hit with chunk metadata from the vector store so the
+    result can be merged with embedding hits.
+    """
+    fts_hits = metadata_store.search_fts(query.semantic_text, limit=n_results * 2)
+    if not fts_hits:
+        return []
+
+    # Build a map of chunk_id -> metadata from ChromaDB for the hit IDs
+    hit_ids = [str(h["chunk_id"]) for h in fts_hits]
+
+    # Fetch just those chunks from the vector store
+    try:
+        chroma_data = vector_store._collection.get(
+            ids=hit_ids,
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return []
+
+    id_to_doc: dict[str, tuple[str, dict]] = {}
+    for cid, doc, meta in zip(
+        chroma_data.get("ids", []),
+        chroma_data.get("documents", []),
+        chroma_data.get("metadatas", []),
+    ):
+        id_to_doc[cid] = (doc, meta or {})
+
+    # FTS5 rank is negative (lower = better); normalise to a 0-1 score
+    ranks = [h["rank"] for h in fts_hits]
+    r_min = min(ranks) if ranks else -1.0
+    r_max = max(ranks) if ranks else 0.0
+    r_range = r_max - r_min
+
+    results: list[SearchResult] = []
+    for h in fts_hits:
+        cid = str(h["chunk_id"])
+        if cid not in id_to_doc:
+            continue
+        doc_text, meta = id_to_doc[cid]
+        # Normalise BM25 rank to [0, 1]; ranks are negative so we invert.
+        norm = (h["rank"] - r_min) / r_range if r_range > 1e-9 else 1.0
+        score = 1.0 - norm  # higher score = better rank
+
+        results.append(SearchResult(
+            chunk_id=cid,
+            text=doc_text,
+            metadata=meta,
+            score=score,
+            authority_weight=int(meta.get("authority_weight", 50)),
+            valid_from=meta.get("valid_from") or meta.get("date"),
+        ))
+
+    return results
+
+
 def _semantic_search(
     query: ClassifiedQuery,
     vector_store: VectorStore,
     n_results: int,
 ) -> list[SearchResult]:
-    """Pure vector similarity search."""
+    """Pure vector similarity search returning a larger candidate pool.
+
+    Returns up to ``n_results * 2`` diversity-filtered results so the
+    caller (search()) can merge with other retrieval strategies before
+    cross-encoder reranking.  Final trimming to n_results happens there.
+    """
     where: dict[str, Any] | None = None
     if query.source_type:
         where = {"source_type": query.source_type}
@@ -420,8 +545,12 @@ def _semantic_search(
 
     results = diverse
 
+    # Return a larger candidate pool (up to 2x n_results) for the caller to
+    # merge with BM25/keyword/filename results before cross-encoder reranking.
+    # We still apply authority ranking here so the embedding ordering is
+    # meaningful when the reranker is unavailable.
     ranked = rank_by_authority(results)
-    return ranked[:n_results]
+    return ranked[: n_results * 2]
 
 
 def _hybrid_search(
