@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Iterator
 
 from verra.agent.llm import LLMClient, RETRIEVAL_TOOL
@@ -26,7 +27,8 @@ Rules:
 - You have a calculate tool. You MUST use it whenever a question involves numbers, totals, sums, differences, averages, percentages, or any arithmetic. Call calculate with a Python expression like "29500 + 9000 + 6000" or "sum([42000, 44500, 46000])". NEVER attempt mental math — always use the tool.
 - When context contains conflicting information, prefer the source with the most recent date. Flag the conflict.
 - If you don't have enough information, say "I don't have that information in your data" clearly.
-- Always cite sources by file name or email subject.
+- Cite sources inline using [1], [2], etc. based on the source numbers in the context (e.g. "Revenue was $1.2M [1]").
+- Every factual claim should have a numbered source reference.
 - Be thorough — list ALL relevant items, don't truncate lists.
 - Be concise. Use bullet points.
 """
@@ -37,7 +39,8 @@ Rules:
 - Base your answers ONLY on the provided context below.
 - When context contains conflicting information, prefer the source with the most recent date. Flag the conflict.
 - If the context doesn't contain enough information, say "I don't have that information in your data."
-- Cite sources by file name (e.g. "according to Q4_2025_Financial_Summary.txt").
+- Cite sources inline using [1], [2], etc. based on the source numbers in the context (e.g. "Revenue was $1.2M [1]").
+- Every factual claim should have a numbered source reference.
 - Be thorough — list ALL relevant items, don't truncate lists.
 - Be concise. Use bullet points.
 - When doing math, show your work step by step.
@@ -49,6 +52,37 @@ _NO_ANSWER = (
 )
 
 _MIN_SCORE = -1.2  # ChromaDB L2 distance threshold — relaxed to avoid rejecting relevant results
+
+
+# Confidence scoring
+
+
+class ConfidenceLevel(str, Enum):
+    HIGH = "high"      # top score > 0.7, 3+ diverse sources
+    MEDIUM = "medium"  # top score > 0.3, 2+ sources
+    LOW = "low"        # top score > 0, any sources
+    NONE = "none"      # no relevant results
+
+
+def compute_confidence(results: list[SearchResult]) -> ConfidenceLevel:
+    """Derive a confidence level from retrieval results."""
+    if not results:
+        return ConfidenceLevel.NONE
+
+    max_score = max(r.score for r in results)
+    unique_files = len({
+        r.metadata.get("file_name", "")
+        for r in results
+        if r.metadata.get("file_name")
+    })
+
+    if max_score > 0.7 and unique_files >= 3:
+        return ConfidenceLevel.HIGH
+    if max_score > 0.3 and unique_files >= 2:
+        return ConfidenceLevel.MEDIUM
+    if results:
+        return ConfidenceLevel.LOW
+    return ConfidenceLevel.NONE
 
 
 # Knowledge assessment
@@ -137,6 +171,7 @@ class ChatResponse:
     query_type: str = "semantic"
     had_context: bool = True
     assessment: KnowledgeAssessment | None = None
+    confidence: ConfidenceLevel = ConfidenceLevel.NONE
 
 
 # Activity callback type
@@ -228,8 +263,13 @@ class ChatEngine:
 
         Call this first to get search results, then pass results to
         stream_with_context() for token-by-token LLM streaming.
+
+        If the query contains coreference signals and there is conversation
+        history, the query is rewritten to be self-contained before retrieval.
+        The original user_message is preserved for the LLM prompt.
         """
-        classified = parse_query(user_message)
+        retrieval_query = self._rewrite_query(user_message)
+        classified = parse_query(retrieval_query)
         results = search(
             classified,
             self.metadata_store,
@@ -370,6 +410,7 @@ class ChatEngine:
             answer = f"{assessment.confidence_note}\n\n{answer}"
 
         sources = _extract_sources(all_results)
+        confidence = compute_confidence(all_results)
 
         self._persist(user_message, answer)
         self._update_history(user_message, answer)
@@ -381,6 +422,7 @@ class ChatEngine:
             query_type=classified.query_type.value,
             had_context=bool(all_results),
             assessment=assessment,
+            confidence=confidence,
         )
 
     # ------------------------------------------------------------------
@@ -428,6 +470,7 @@ class ChatEngine:
                 query_type=classified.query_type.value,
                 had_context=False,
                 assessment=assessment,
+                confidence=ConfidenceLevel.NONE,
             )
 
         context_blocks = _format_context(results)
@@ -462,6 +505,7 @@ class ChatEngine:
             answer = f"{assessment.confidence_note}\n\n{answer}"
 
         sources = _extract_sources(results)
+        confidence = compute_confidence(results)
 
         self._persist(user_message, answer)
         self._update_history(user_message, answer)
@@ -473,12 +517,64 @@ class ChatEngine:
             query_type=classified.query_type.value,
             had_context=True,
             assessment=assessment,
+            confidence=confidence,
         )
 
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    _COREF_SIGNALS: frozenset[str] = frozenset({
+        'it', 'its', 'they', 'them', 'their', 'this', 'that',
+        'those', 'these', 'he', 'she', 'his', 'her', 'the same',
+        'above', 'mentioned', 'previous',
+    })
+
+    def _rewrite_query(self, user_message: str) -> str:
+        """Rewrite a follow-up question to be self-contained using conversation history.
+
+        If the query contains pronouns or references that need context from
+        prior turns, expand them using a short LLM call. Otherwise return
+        the query unchanged. The original message (not the rewrite) must be
+        used for the LLM prompt so the user sees natural phrasing.
+        """
+        if not self._history:
+            return user_message
+
+        # Quick check: does the query contain likely coreferences?
+        words = set(user_message.lower().split())
+        if not words & self._COREF_SIGNALS:
+            return user_message  # No coreferences detected — skip the extra call
+
+        # Use the LLM to rewrite (one short call with minimal context)
+        rewrite_messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "Rewrite the user's follow-up question to be self-contained, "
+                    "replacing pronouns and references with the actual entities from "
+                    "the conversation. Output ONLY the rewritten question, nothing else. "
+                    "If the question is already self-contained, output it unchanged."
+                ),
+            },
+        ]
+        # Include last 2 turns of history for context (4 messages)
+        for msg in self._history[-4:]:
+            rewrite_messages.append(msg)
+        rewrite_messages.append(
+            {"role": "user", "content": f"Rewrite this question: {user_message}"}
+        )
+
+        try:
+            rewritten = self.llm.complete(rewrite_messages).strip()
+            # Sanity check: rewritten should be similar length, not a full answer
+            if (len(rewritten) < len(user_message) * 3 and '?' in rewritten) or len(rewritten) < 200:
+                return rewritten
+        except Exception:
+            pass
+
+        return user_message
 
     def _persist(self, user_message: str, answer: str) -> None:
         self.memory_store.add_message(self.conversation_id, "user", user_message)

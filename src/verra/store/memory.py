@@ -43,10 +43,16 @@ CREATE TABLE IF NOT EXISTS messages (
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     role            TEXT    NOT NULL,  -- 'user' | 'assistant' | 'system'
     content         TEXT    NOT NULL,
-    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+    feedback        TEXT                -- 'positive' | 'negative' | NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
+"""
+
+# Migration: add feedback column to existing databases that pre-date the schema change.
+_MIGRATE_MESSAGES_FEEDBACK = """
+ALTER TABLE messages ADD COLUMN feedback TEXT;
 """
 
 
@@ -59,6 +65,7 @@ class MemoryStore:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._apply_migrations()
         self._conn.commit()
 
     @classmethod
@@ -72,8 +79,17 @@ class MemoryStore:
         instance.db_path = Path(":memory:")  # sentinel — not a real path
         instance._conn = conn
         instance._conn.executescript(_SCHEMA)
+        instance._apply_migrations()
         instance._conn.commit()
         return instance
+
+    def _apply_migrations(self) -> None:
+        """Apply incremental schema migrations gracefully."""
+        # Add feedback column if it doesn't exist yet.
+        try:
+            self._conn.execute(_MIGRATE_MESSAGES_FEEDBACK)
+        except Exception:
+            pass  # column already exists — that's fine
 
     # ------------------------------------------------------------------
     # Memory (facts, preferences, etc.)
@@ -181,6 +197,34 @@ class MemoryStore:
             (conversation_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def record_feedback(self, conversation_id: int, rating: str) -> None:
+        """Record user feedback on the last assistant message in a conversation.
+
+        Parameters
+        ----------
+        conversation_id:
+            The conversation to update.
+        rating:
+            'positive' or 'negative'.
+        """
+        try:
+            self._conn.execute(
+                """
+                UPDATE messages
+                SET feedback = ?
+                WHERE id = (
+                    SELECT id FROM messages
+                    WHERE conversation_id = ? AND role = 'assistant'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                )
+                """,
+                (rating, conversation_id),
+            )
+            self._conn.commit()
+        except Exception:
+            pass  # non-critical — never crash the chat loop
 
     # ------------------------------------------------------------------
     # Lifecycle
