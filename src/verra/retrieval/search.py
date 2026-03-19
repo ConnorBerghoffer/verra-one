@@ -155,7 +155,10 @@ def search(
 
     if query.query_type == QueryType.METADATA:
         return _metadata_search(query, metadata_store, n_results)
-    elif query.query_type == QueryType.SEMANTIC:
+    elif query.query_type in (QueryType.SEMANTIC, QueryType.COMPARATIVE,
+                               QueryType.TEMPORAL_TREND, QueryType.HYPOTHETICAL,
+                               QueryType.META, QueryType.GAP, QueryType.MULTI_HOP,
+                               QueryType.STATE_LOOKUP):
         # Gather candidates from all retrieval strategies.
         # _semantic_search returns a larger candidate set without final reranking.
         embedding_results = _semantic_search(query, vector_store, n_results)
@@ -170,24 +173,31 @@ def search(
         # BM25 full-text search from SQLite FTS5
         bm25_hits = _bm25_search(query, metadata_store, vector_store, n_results)
 
-        # Merge all candidate pools, deduplicate by chunk_id.
-        # Embedding results go first so their diversity-filtered ordering
-        # acts as a tiebreaker when scores are equal before reranking.
+        # Reserve filename hits — if a file is literally named after the
+        # query topic (e.g. "PTO" → pto_log.csv), it MUST appear in results
+        # regardless of what the reranker thinks.
+        reserved: list[SearchResult] = []
+        reserved_ids: set[str] = set()
+        for r in fname_hits:
+            reserved.append(r)
+            reserved_ids.add(r.chunk_id)
+
+        # Merge remaining candidates for reranking, excluding reserved.
         merged: list[SearchResult] = []
-        seen_ids: set[str] = set()
-        for r in embedding_results + bm25_hits + keyword_hits + fname_hits:
+        seen_ids: set[str] = set(reserved_ids)
+        for r in embedding_results + bm25_hits + keyword_hits:
             if r.chunk_id not in seen_ids:
                 merged.append(r)
                 seen_ids.add(r.chunk_id)
 
-        # Cross-encoder reranking adjudicates between all retrieval strategies.
-        # We pass up to 4x n_results candidates to give the reranker enough
-        # material to work with while keeping inference time reasonable.
+        # Cross-encoder reranking adjudicates between retrieval strategies.
         rerank_n = n_results * 4
         reranked = rerank(query.semantic_text, merged, rerank_n)
 
-        # Authority ranking as a final tiebreaker among close reranker scores
-        results = rank_by_authority(reranked)[:n_results]
+        # Combine: reserved filename hits first, then reranked results.
+        # Trim to n_results total.
+        combined = reserved + reranked
+        results = rank_by_authority(combined)[:n_results]
         return results
     else:
         return _hybrid_search(query, metadata_store, vector_store, n_results)
