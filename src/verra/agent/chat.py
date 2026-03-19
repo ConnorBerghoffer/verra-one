@@ -194,12 +194,14 @@ class ChatEngine:
         n_results: int = 12,
         conversation_id: int | None = None,
         entity_store: Any | None = None,       # EntityStore
+        tabular_store: Any | None = None,      # TabularStore
     ) -> None:
         self.llm = llm
         self.metadata_store = metadata_store
         self.vector_store = vector_store
         self.memory_store = memory_store
         self.entity_store = entity_store
+        self.tabular_store = tabular_store
         self.n_results = n_results
 
         # Conversation session
@@ -267,6 +269,10 @@ class ChatEngine:
         If the query contains coreference signals and there is conversation
         history, the query is rewritten to be self-contained before retrieval.
         The original user_message is preserved for the LLM prompt.
+
+        Includes an agentic relevance-grading step: if the first results do not
+        cover the query terms well, the query is expanded/rewritten and a second
+        search is issued.  Both result sets are merged and re-ranked by score.
         """
         retrieval_query = self._rewrite_query(user_message)
         classified = parse_query(retrieval_query)
@@ -277,6 +283,29 @@ class ChatEngine:
             n_results=self.n_results + 4,
             entity_store=self.entity_store,
         )
+
+        # Grade relevance and retry with a rewritten query if coverage is poor
+        is_relevant, rewritten = self._grade_relevance(user_message, results)
+        if not is_relevant and rewritten != user_message:
+            classified2 = parse_query(rewritten)
+            results2 = search(
+                classified2,
+                self.metadata_store,
+                self.vector_store,
+                n_results=self.n_results + 4,
+                entity_store=self.entity_store,
+            )
+            # Merge: deduplicate by chunk_id, prefer results2 for new chunks
+            seen = {r.chunk_id for r in results}
+            for r in results2:
+                if r.chunk_id not in seen:
+                    results.append(r)
+                    seen.add(r.chunk_id)
+
+            # Re-sort by score and trim to budget
+            results.sort(key=lambda r: r.score, reverse=True)
+            results = results[: self.n_results + 4]
+
         return results, classified
 
     def stream_with_context(
@@ -294,7 +323,19 @@ class ChatEngine:
             self._set_conversation_title(user_message)
             return
 
-        context_blocks = _format_context(results)
+        context_blocks = _format_context_with_full_docs(results)
+
+        # Attempt to answer tabular questions via SQL before sending to LLM
+        sql_result = self._try_sql_answer(user_message, results)
+        if sql_result is not None:
+            # Put the SQL answer PROMINENTLY at the top with a clear instruction
+            sql_context = (
+                "IMPORTANT: A SQL query was run against your structured data and returned "
+                "the following result. Use this data to answer the question directly.\n\n"
+                + sql_result
+            )
+            context_blocks = sql_context + "\n\n---\n\n" + context_blocks
+
         messages = _build_messages(
             system=_STREAM_SYSTEM_PROMPT,
             history=self._history,
@@ -346,6 +387,7 @@ class ChatEngine:
             vector_store=self.vector_store,
             memory_store=self.memory_store,
             entity_store=self.entity_store,
+            tabular_store=self.tabular_store,
         )
 
         def tool_handler(tool_name: str, args: dict[str, Any]) -> str:
@@ -473,7 +515,7 @@ class ChatEngine:
                 confidence=ConfidenceLevel.NONE,
             )
 
-        context_blocks = _format_context(results)
+        context_blocks = _format_context_with_full_docs(results)
 
         messages = _build_messages(
             system=_SYSTEM_PROMPT,
@@ -522,14 +564,76 @@ class ChatEngine:
 
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Relevance grading
     # ------------------------------------------------------------------
+
+    _GRADE_STOP: frozenset[str] = frozenset({
+        "what", "is", "the", "our", "how", "many", "much", "who", "does",
+        "do", "did", "are", "were", "was", "can", "will", "a", "an", "and",
+        "or", "for", "in", "on", "at", "to", "of", "by", "from", "with",
+        "about", "this", "that", "has", "have", "been", "not", "which",
+        "best", "most", "top", "all", "any",
+    })
+
+    _GRADE_REWRITE_MAP: dict[str, str] = {
+        "win": "won closed",
+        "rate": "percentage ratio",
+        "spend": "cost expense",
+        "trend": "over time monthly",
+        "pto": "vacation leave time off days",
+        "p1": "priority critical urgent",
+    }
+
+    def _grade_relevance(
+        self, query: str, results: list[SearchResult]
+    ) -> tuple[bool, str]:
+        """Quick check: do the retrieved chunks actually answer the query?
+
+        Returns (is_relevant, rewritten_query_if_not).
+        Uses a lightweight keyword-coverage heuristic.  If coverage is low,
+        expands query terms using a synonym map and returns the expansion as
+        the rewritten query so retrieve() can make a second pass.
+        """
+        if not results:
+            return False, query
+
+        # Extract meaningful terms from the query
+        query_terms = [
+            w.lower()
+            for w in re.findall(r"\w+", query)
+            if len(w) >= 3 and w.lower() not in self._GRADE_STOP
+        ]
+
+        if not query_terms:
+            return True, query  # Nothing to grade — assume relevant
+
+        # Check how many query terms appear across the top results
+        combined_text = " ".join(r.text.lower() for r in results[:5])
+        matches = sum(1 for t in query_terms if t in combined_text)
+        coverage = matches / len(query_terms)
+
+        if coverage >= 0.5:
+            return True, query  # Good enough
+
+        # Low coverage — expand terms with synonyms for a second-pass search
+        expanded: list[str] = []
+        for t in query_terms:
+            expanded.append(t)
+            if t in self._GRADE_REWRITE_MAP:
+                expanded.extend(self._GRADE_REWRITE_MAP[t].split())
+
+        rewritten = " ".join(expanded)
+        return False, rewritten
 
     _COREF_SIGNALS: frozenset[str] = frozenset({
         'it', 'its', 'they', 'them', 'their', 'this', 'that',
         'those', 'these', 'he', 'she', 'his', 'her', 'the same',
         'above', 'mentioned', 'previous',
     })
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _rewrite_query(self, user_message: str) -> str:
         """Rewrite a follow-up question to be self-contained using conversation history.
@@ -575,6 +679,99 @@ class ChatEngine:
             pass
 
         return user_message
+
+    # Keywords that suggest a tabular / analytical question
+    _TABULAR_SIGNALS: frozenset[str] = frozenset({
+        "which", "best", "worst", "most", "least", "top", "bottom",
+        "count", "total", "average", "avg", "sum", "rank", "ranking",
+        "compare", "comparison", "highest", "lowest", "max", "min",
+        "rate", "ratio", "percent", "percentage", "how many",
+    })
+
+    def _try_sql_answer(
+        self, user_message: str, results: list[SearchResult]
+    ) -> str | None:
+        """If the question looks tabular and we have relevant CSV tables, run SQL.
+
+        Asks the LLM to generate a SELECT query, executes it, and returns a
+        formatted block with the SQL and its results.  Returns None on any
+        failure so the caller can proceed without SQL context.
+        """
+        if self.tabular_store is None:
+            return None
+
+        tables = self.tabular_store.list_tables()
+        if not tables:
+            return None
+
+        # Only trigger when the retrieved sources include at least one CSV
+        csv_sources = [r for r in results if r.metadata.get("format") == "csv"]
+        if not csv_sources:
+            return None
+
+        # Only trigger if the question contains analytical signal words
+        lower_msg = user_message.lower()
+        if not any(signal in lower_msg for signal in self._TABULAR_SIGNALS):
+            return None
+
+        # Build schema description with sample data for the prompt
+        table_schemas: list[str] = []
+        for t in tables:
+            cols = ", ".join(
+                f"{c['name']} ({c['type']})" for c in t["columns"]
+            )
+            schema_line = f"Table '{t['table_name']}': {cols}"
+            # Include sample rows so the LLM knows actual column values
+            samples = self.tabular_store.get_sample_rows(t["table_name"], limit=2)
+            if samples:
+                sample_strs = []
+                for s in samples:
+                    vals = ", ".join(f"{k}={v!r}" for k, v in list(s.items())[:6])
+                    sample_strs.append(f"  Example: {vals}")
+                schema_line += "\n" + "\n".join(sample_strs)
+            table_schemas.append(schema_line)
+
+        sql_prompt: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate a single SQL SELECT query to answer the user's question. "
+                    "Output ONLY the SQL query, nothing else. No markdown, no explanation. "
+                    "Available tables:\n" + "\n".join(table_schemas)
+                ),
+            },
+            {"role": "user", "content": user_message},
+        ]
+
+        try:
+            sql = self.llm.complete(sql_prompt).strip()
+            # Strip markdown code fences if present
+            sql = re.sub(r"```sql\s*", "", sql, flags=re.IGNORECASE)
+            sql = sql.replace("```", "").strip()
+            if not sql.upper().startswith("SELECT"):
+                return None
+            query_results = self.tabular_store.query(sql)
+            if not query_results:
+                return None
+            headers = list(query_results[0].keys())
+            lines = [" | ".join(headers)]
+            lines.append("-" * len(lines[0]))
+            for row in query_results[:20]:
+                lines.append(
+                    " | ".join(
+                        str(row[h]) if row[h] is not None else "" for h in headers
+                    )
+                )
+            result_table = "\n".join(lines)
+            return (
+                f"[SQL Query executed against tabular data]\n"
+                f"Query: {sql}\n\n"
+                f"Results:\n{result_table}"
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug("SQL query failed: %s", exc)
+            return None
 
     def _persist(self, user_message: str, answer: str) -> None:
         self.memory_store.add_message(self.conversation_id, "user", user_message)
@@ -636,6 +833,54 @@ def _format_context(results: list[SearchResult]) -> str:
         source_label = _source_label(r.metadata)
         authority_note = f" [authority: {r.authority_weight}]" if r.authority_weight != 50 else ""
         parts.append(f"[Source {i + 1}: {source_label}{authority_note}]\n{r.text}")
+    return "\n\n---\n\n".join(parts)
+
+
+_FULL_DOC_SIZE_LIMIT = 8_000  # bytes — pull the entire file when smaller than this
+
+
+def _format_context_with_full_docs(results: list[SearchResult]) -> str:
+    """Format context, pulling full documents for small files.
+
+    For each result, if the source file exists and is below the size limit we
+    read the entire file and substitute it for the chunk text.  When two chunks
+    originate from the same file we include the full-doc text only once,
+    skipping the duplicate chunk.  This gives the LLM complete context for
+    small documents (org charts, policy files, config files, etc.) rather than
+    just an 800-character fragment.
+    """
+    from pathlib import Path
+
+    parts: list[str] = []
+    seen_files: set[str] = set()
+    source_index = 1  # we track our own counter because we may skip entries
+
+    for r in results:
+        source_label = _source_label(r.metadata)
+        authority_note = (
+            f" [authority: {r.authority_weight}]" if r.authority_weight != 50 else ""
+        )
+
+        file_path = r.metadata.get("file_path", "")
+        file_name = r.metadata.get("file_name", "") or file_path
+
+        text = r.text
+
+        if file_path:
+            if file_name in seen_files:
+                # Full document already included — skip this duplicate chunk
+                continue
+            try:
+                p = Path(file_path)
+                if p.exists() and p.stat().st_size < _FULL_DOC_SIZE_LIMIT:
+                    text = p.read_text(errors="replace")
+                    seen_files.add(file_name)
+            except Exception:
+                pass  # Fall back to chunk text on any I/O error
+
+        parts.append(f"[Source {source_index}: {source_label}{authority_note}]\n{text}")
+        source_index += 1
+
     return "\n\n---\n\n".join(parts)
 
 
