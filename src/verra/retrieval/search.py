@@ -98,20 +98,116 @@ def search(
     if query.query_type == QueryType.METADATA:
         return _metadata_search(query, metadata_store, n_results)
     elif query.query_type == QueryType.SEMANTIC:
-        results = _semantic_search(query, vector_store, n_results)
-        # Always supplement with keyword search — embeddings miss specific
-        # names, acronyms, and terms that keyword matching catches reliably.
+        embedding_results = _semantic_search(query, vector_store, n_results)
+
+        # Reserve top embedding hits — these should always appear in the
+        # final results since the embedding model captured genuine semantic
+        # relevance that keyword matching can miss.
+        reserved = embedding_results[:3]
+        rest = embedding_results[3:]
+
+        # Supplement with keyword search — catches specific names, acronyms
         keyword_hits = _keyword_fallback(query, vector_store, n_results)
-        if keyword_hits:
-            existing_ids = {r.chunk_id for r in results}
-            for kh in keyword_hits:
-                if kh.chunk_id not in existing_ids:
-                    results.append(kh)
-                    existing_ids.add(kh.chunk_id)
-            results = rank_by_authority(results)[:n_results]
+
+        # Guarantee: if a file's name contains significant query keywords,
+        # include it. Catches "PTO" → pto_log_2025.csv etc.
+        fname_hits = _filename_search(query, vector_store, n_results=3)
+
+        # Merge: reserved embedding hits first, then fill from all pools.
+        # Keyword/filename scores are on a different scale (0-1 vs embedding
+        # scores which can be negative), so cap supplemental scores to not
+        # outrank the top embedding hits.
+        existing_ids = {r.chunk_id for r in reserved}
+        if reserved:
+            max_reserved_score = max(r.score for r in reserved)
+        else:
+            max_reserved_score = 0.5
+        pool = rest + keyword_hits + fname_hits
+        for r in pool:
+            if r.chunk_id not in existing_ids:
+                # Cap supplemental scores just below the best embedding hit
+                # so they enrich but don't override semantic relevance.
+                r.score = min(r.score, max_reserved_score - 0.01)
+                reserved.append(r)
+                existing_ids.add(r.chunk_id)
+
+        results = rank_by_authority(reserved)[:n_results]
         return results
     else:
         return _hybrid_search(query, metadata_store, vector_store, n_results)
+
+
+def _filename_search(
+    query: ClassifiedQuery,
+    vector_store: VectorStore,
+    n_results: int = 3,
+) -> list[SearchResult]:
+    """Find chunks from files whose names match query keywords.
+
+    This catches the common case where a file like "pto_log_2025.csv" or
+    "tickets_2025.csv" is the obvious answer but neither embedding nor
+    keyword text matching surfaces it strongly enough.
+    """
+    import re as _re
+
+    _stop = {"what", "is", "the", "our", "how", "many", "much", "who", "does",
+             "do", "did", "are", "were", "was", "can", "will", "a", "an", "and", "or",
+             "for", "in", "on", "at", "to", "of", "by", "from", "with", "about",
+             "this", "that", "its", "has", "have", "had", "been", "not", "take",
+             "find", "all", "any", "get", "show", "tell", "give", "list"}
+    keywords = [
+        w.lower() for w in _re.findall(r"\w+", query.semantic_text)
+        if len(w) >= 3 and w.lower() not in _stop
+    ]
+    if not keywords:
+        return []
+
+    try:
+        all_data = vector_store._collection.get(include=["documents", "metadatas"])
+    except Exception:
+        return []
+
+    # Score each chunk by how many keywords appear in its file name
+    scored: list[tuple[float, SearchResult]] = []
+    for chunk_id, text, meta in zip(
+        all_data.get("ids", []),
+        all_data.get("documents", []),
+        all_data.get("metadatas", []),
+    ):
+        fname = (meta or {}).get("file_name", "")
+        if not fname:
+            continue
+        fname_lower = fname.lower()
+        fname_matches = sum(1 for kw in keywords if kw in fname_lower)
+        if fname_matches < 1:
+            continue
+
+        # Score heavily weighted to file name matches
+        score = 0.7 + (0.15 * fname_matches)
+
+        scored.append((score, SearchResult(
+            chunk_id=chunk_id,
+            text=text,
+            metadata=meta or {},
+            score=score,
+            authority_weight=int((meta or {}).get("authority_weight", 50)),
+        )))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Max 1 chunk per file
+    seen_files: set[str] = set()
+    results: list[SearchResult] = []
+    for _, sr in scored:
+        fname = sr.metadata.get("file_name", "")
+        if fname in seen_files:
+            continue
+        seen_files.add(fname)
+        results.append(sr)
+        if len(results) >= n_results:
+            break
+
+    return results
 
 
 def _keyword_fallback(
@@ -127,9 +223,10 @@ def _keyword_fallback(
     import re as _re
 
     _stop = {"what", "is", "the", "our", "how", "many", "much", "who", "does",
-             "do", "are", "were", "was", "can", "will", "a", "an", "and", "or",
+             "do", "did", "are", "were", "was", "can", "will", "a", "an", "and", "or",
              "for", "in", "on", "at", "to", "of", "by", "from", "with", "about",
-             "this", "that", "its", "has", "have", "had", "been", "not"}
+             "this", "that", "its", "has", "have", "had", "been", "not", "take",
+             "find", "all", "any", "get", "show", "tell", "give", "list"}
     keywords = [
         w.lower() for w in _re.findall(r"\w+", query.semantic_text)
         if len(w) >= 3 and w.lower() not in _stop
@@ -149,20 +246,20 @@ def _keyword_fallback(
         all_data.get("metadatas", []),
     ):
         text_lower = text.lower()
-        matches = sum(1 for kw in keywords if kw in text_lower)
+        fname_lower = (meta or {}).get("file_name", "").lower()
+        # Match against both chunk text AND file name
+        matches = sum(1 for kw in keywords if kw in text_lower or kw in fname_lower)
         if matches == 0:
             continue
         ratio = matches / len(keywords)
         # Score based on keyword match ratio — high enough to compete
         # with embedding results, since keyword hits are often more precise
         score = ratio * 0.8  # max +0.8 for full match
-
-        # Penalize CSV chunks same as in semantic search
-        if (meta or {}).get("format") == "csv":
-            score -= 0.4
-
-        if score <= 0:
-            continue
+        # Strong bonus when keywords appear in the file name — a file named
+        # "pto_log" matching query "PTO" is a very high-confidence signal.
+        fname_matches = sum(1 for kw in keywords if kw in fname_lower)
+        if fname_matches > 0:
+            score += 0.15 * fname_matches
 
         scored.append((score, SearchResult(
             chunk_id=chunk_id,
@@ -174,15 +271,24 @@ def _keyword_fallback(
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # Document diversity: max 2 per file
+    # Diversity: max 2 per file, max 3 CSV total
     diverse: list[SearchResult] = []
     doc_counts: dict[str, int] = {}
+    csv_count = 0
     for _, sr in scored:
         fname = sr.metadata.get("file_name", "")
-        count = doc_counts.get(fname, 0)
-        if count < 2:
-            diverse.append(sr)
-            doc_counts[fname] = count + 1
+        is_csv = sr.metadata.get("format") == "csv"
+
+        file_count = doc_counts.get(fname, 0)
+        if file_count >= 2:
+            continue
+        if is_csv and csv_count >= 3:
+            continue
+
+        diverse.append(sr)
+        doc_counts[fname] = file_count + 1
+        if is_csv:
+            csv_count += 1
         if len(diverse) >= n_results:
             break
 
@@ -276,12 +382,6 @@ def _semantic_search(
         elif doc_len < 1500:
             score += 0.05
 
-        # Penalize CSV chunks — they're repetitive tabular data that
-        # overwhelm prose documents when the corpus has large CSVs.
-        doc_format = h["metadata"].get("format", "")
-        if doc_format == "csv":
-            score -= 0.4
-
         results.append(SearchResult(
             chunk_id=h["id"],
             text=text,
@@ -291,18 +391,34 @@ def _semantic_search(
             valid_from=h["metadata"].get("valid_from") or h["metadata"].get("date"),
         ))
 
-    # Document diversity: limit to max 2 chunks per source file
-    # to prevent large files from dominating results.
-    if len(results) > n_results:
-        diverse: list[SearchResult] = []
-        doc_counts: dict[str, int] = {}
-        for r in sorted(results, key=lambda x: x.score, reverse=True):
-            fname = r.metadata.get("file_name", "")
-            count = doc_counts.get(fname, 0)
-            if count < 2:
-                diverse.append(r)
-                doc_counts[fname] = count + 1
-        results = diverse
+    # Diversity filtering: sort by score, then enforce two caps:
+    #  1. Max 2 chunks per source file (prevents one big file dominating)
+    #  2. Max 3 CSV chunks total (CSV data can appear but can't drown prose)
+    # This lets CSV data surface when genuinely relevant without overwhelming.
+    results.sort(key=lambda x: x.score, reverse=True)
+    diverse: list[SearchResult] = []
+    doc_counts: dict[str, int] = {}
+    csv_count = 0
+    max_csv = 3
+    for r in results:
+        fname = r.metadata.get("file_name", "")
+        is_csv = r.metadata.get("format") == "csv"
+
+        # Per-file cap
+        file_count = doc_counts.get(fname, 0)
+        if file_count >= 2:
+            continue
+
+        # Format cap for CSV
+        if is_csv and csv_count >= max_csv:
+            continue
+
+        diverse.append(r)
+        doc_counts[fname] = file_count + 1
+        if is_csv:
+            csv_count += 1
+
+    results = diverse
 
     ranked = rank_by_authority(results)
     return ranked[:n_results]
