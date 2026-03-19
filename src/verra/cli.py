@@ -130,19 +130,51 @@ def _print_model_recommendations() -> None:
     console.print()
 
 
+def _get_doc_count() -> int:
+    """Quick doc count from core.db, 0 if not available."""
+    import sqlite3
+    from verra.config import VERRA_HOME
+
+    core_db = VERRA_HOME / "core.db"
+    if not core_db.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(str(core_db))
+        count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
+
+
 def _print_banner(model: str) -> None:
-    """Print the Verra One startup banner."""
+    """Print the Verra One MOTD."""
+    from rich.rule import Rule
+
+    doc_count = _get_doc_count()
+    docs_str = f"{doc_count} docs indexed" if doc_count > 0 else "no data yet"
+
     console.print()
+    console.print(Rule(
+        Text.assemble((" verra one ", "bold cyan")),
+        style="dim",
+    ))
+    console.print()
+    console.print(f"  [dim]model[/dim]  {model}")
+    console.print(f"  [dim]data [/dim]  {docs_str}")
+    if doc_count == 0:
+        console.print(f"  [dim]      [/dim]  [yellow]run: verra ingest <folder>[/yellow]")
+    console.print()
+
+
+def _print_status_bar(model: str) -> None:
+    """Print the bottom status strip."""
+    doc_count = _get_doc_count()
+    docs_str = f"{doc_count} docs" if doc_count > 0 else "no data"
+    model_short = model.split("/")[-1] if "/" in model else model
     console.print(
-        Text.assemble(
-            ("  verra", "bold cyan"),
-            ("  v", "dim"),
-            (__version__, "dim"),
-        )
+        f"[dim]  {model_short} | {docs_str} | /help for commands | Ctrl+C to quit[/dim]"
     )
-    console.print(f"  [dim]model: {model}[/dim]")
-    console.print()
-    console.print("  [dim]Type a question about your data. /help for commands, Ctrl+C to quit.[/dim]")
     console.print()
 
 
@@ -201,6 +233,7 @@ def _run_chat_repl(model_override: str | None = None) -> None:
     )
 
     _print_banner(effective_model)
+    _print_status_bar(effective_model)
 
     # prompt_toolkit setup — Enter sends, Escape+Enter for newline
     bindings = KeyBindings()
@@ -248,6 +281,7 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                 elif cmd == "/clear":
                     console.clear()
                     _print_banner(effective_model)
+                    _print_status_bar(effective_model)
                     continue
                 elif cmd == "/new":
                     engine.conversation_id = engine.memory_store.new_conversation()
@@ -276,7 +310,11 @@ def _run_chat_repl(model_override: str | None = None) -> None:
             try:
                 full_response: list[str] = []
                 with Live(
-                    Text("", style="dim"),
+                    Panel(
+                        Text("...", style="dim"),
+                        border_style="dim",
+                        padding=(0, 1),
+                    ),
                     console=console,
                     refresh_per_second=12,
                     vertical_overflow="visible",
@@ -285,16 +323,29 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                         full_response.append(chunk)
                         accumulated = "".join(full_response)
                         try:
-                            live.update(Markdown(accumulated))
+                            content = Markdown(accumulated)
                         except Exception:
-                            live.update(Text(accumulated))
+                            content = Text(accumulated)
+                        live.update(Panel(
+                            content,
+                            border_style="cyan",
+                            padding=(0, 1),
+                        ))
 
                 console.print()
 
             except RuntimeError as exc:
-                console.print(f"[red]Error:[/red] {exc}\n")
+                console.print(Panel(
+                    f"[red]{exc}[/red]",
+                    border_style="red",
+                    padding=(0, 1),
+                ))
             except Exception as exc:
-                console.print(f"[red]Error:[/red] {exc}\n")
+                console.print(Panel(
+                    f"[red]{exc}[/red]",
+                    border_style="red",
+                    padding=(0, 1),
+                ))
                 if "--debug" in sys.argv:
                     import traceback
                     traceback.print_exc()
@@ -307,20 +358,27 @@ def _run_chat_repl(model_override: str | None = None) -> None:
 
 def _print_help() -> None:
     """Print in-REPL help."""
+    from rich.columns import Columns
+
     console.print()
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column("Command", style="cyan")
-    table.add_column("Description")
-    table.add_row("/help", "Show this help")
-    table.add_row("/status", "Show ingestion stats")
-    table.add_row("/briefing", "Show actionable insights")
-    table.add_row("/search <query>", "Search without LLM")
-    table.add_row("/new", "Start a new conversation")
-    table.add_row("/clear", "Clear the screen")
-    table.add_row("/model", "Show current model")
-    table.add_row("/exit", "Quit")
-    console.print(table)
-    console.print()
+    left = (
+        "[cyan]/search[/cyan] [dim]<query>[/dim]  search without LLM\n"
+        "[cyan]/briefing[/cyan]        actionable insights\n"
+        "[cyan]/status[/cyan]          ingestion stats\n"
+        "[cyan]/model[/cyan]           current model"
+    )
+    right = (
+        "[cyan]/new[/cyan]             new conversation\n"
+        "[cyan]/clear[/cyan]           clear screen\n"
+        "[cyan]/help[/cyan]            this help\n"
+        "[cyan]/exit[/cyan]            quit"
+    )
+    console.print(Panel(
+        Columns([left, right], padding=(0, 4)),
+        title="[dim]commands[/dim]",
+        border_style="dim",
+        padding=(0, 1),
+    ))
     console.print("  [dim]Enter sends your message. Escape+Enter for newline.[/dim]")
     console.print()
 
