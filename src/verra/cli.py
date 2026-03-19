@@ -255,6 +255,8 @@ def _run_chat_repl(model_override: str | None = None) -> None:
 
     # Track last retrieval results so /sources can display them
     _last_results: list[Any] = []
+    # Track last conversation_id for feedback recording
+    _last_conv_id: list[int | None] = [None]
 
     try:
         while True:
@@ -268,6 +270,19 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                 break
 
             if not user_input:
+                continue
+
+            # Feedback shortcut — y/n/yes/no after a response records rating
+            if user_input.strip().lower() in ("y", "n", "yes", "no"):
+                if _last_conv_id[0] is not None:
+                    rating = (
+                        "positive"
+                        if user_input.strip().lower() in ("y", "yes")
+                        else "negative"
+                    )
+                    engine.memory_store.record_feedback(_last_conv_id[0], rating)
+                    console.print("  [dim]noted.[/dim]\n")
+                    _last_conv_id[0] = None
                 continue
 
             # Built-in slash commands
@@ -301,6 +316,9 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                     continue
                 elif cmd == "/sources":
                     _repl_show_sources(_last_results)
+                    continue
+                elif cmd == "/docs":
+                    _repl_show_docs()
                     continue
                 elif cmd.startswith("/search"):
                     search_query = user_input[len("/search"):].strip()
@@ -356,6 +374,10 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                     f"{t_retrieval:.1f}s[/dim]"
                 )
 
+                # Compute confidence from retrieval results
+                from verra.agent.chat import ConfidenceLevel, compute_confidence
+                confidence = compute_confidence(results)
+
                 # Phase 2: streaming LLM response with live panel
                 full_response: list[str] = []
 
@@ -383,18 +405,60 @@ def _run_chat_repl(model_override: str | None = None) -> None:
                         ))
 
                 elapsed = time.time() - t_start
+                answer_text = "".join(full_response)
 
-                # Source footer below the response panel
-                if unique_sources:
+                # Build inline citation legend: map [N] references in the response
+                # to actual filenames from retrieval results.
+                import re as _re_cite
+                cited_nums = {int(m) for m in _re_cite.findall(r'\[(\d+)\]', answer_text)}
+                legend_parts: list[str] = []
+                for _ci, _cr in enumerate(results, 1):
+                    if _ci in cited_nums:
+                        _fname = (_cr.metadata.get("file_name", "")
+                                  or _cr.metadata.get("subject", "")
+                                  or _cr.metadata.get("source_type", f"source {_ci}"))
+                        legend_parts.append(f"[{_ci}] {_fname}")
+
+                # Confidence badge + source footer below the response panel
+                _confidence_badges = {
+                    ConfidenceLevel.HIGH:   "[green]\u25a0[/green]",
+                    ConfidenceLevel.MEDIUM: "[yellow]\u25a0[/yellow]",
+                    ConfidenceLevel.LOW:    "[red]\u25a0[/red]",
+                }
+                badge = _confidence_badges.get(confidence, "")
+
+                if legend_parts:
+                    # Numbered citation legend — only sources actually cited in text
+                    legend_str = " \u00b7 ".join(legend_parts)
+                    if badge:
+                        console.print(
+                            f"  {badge} [dim]{confidence.value} confidence \u00b7 {legend_str}[/dim]"
+                        )
+                    else:
+                        console.print(f"  [dim]{legend_str}[/dim]")
+                elif unique_sources:
+                    # Fallback: plain source list when no [N] markers were used
                     sources_str = " \u00b7 ".join(unique_sources[:5])
                     if len(unique_sources) > 5:
                         sources_str += f" \u00b7 +{len(unique_sources) - 5} more"
-                    console.print(f"  [dim]{sources_str}[/dim]")
+                    if badge:
+                        console.print(
+                            f"  {badge} [dim]{confidence.value} confidence \u00b7 {sources_str}[/dim]"
+                        )
+                    else:
+                        console.print(f"  [dim]{sources_str}[/dim]")
+                elif badge:
+                    console.print(f"  {badge} [dim]{confidence.value} confidence[/dim]")
+
                 console.print(
                     f"  [dim]{len(results)} chunks \u00b7 "
                     f"{len(unique_sources)} sources \u00b7 "
                     f"{elapsed:.1f}s[/dim]"
                 )
+
+                # Feedback prompt — user can type y/n as their next input
+                _last_conv_id[0] = engine.conversation_id
+                console.print("  [dim]helpful? [y/n][/dim]")
                 console.print()
 
             except RuntimeError as exc:
@@ -427,6 +491,7 @@ def _print_help() -> None:
     left = (
         "[cyan]/search[/cyan] [dim]<query>[/dim]  search without LLM\n"
         "[cyan]/sources[/cyan]         sources from last answer\n"
+        "[cyan]/docs[/cyan]            browse ingested documents\n"
         "[cyan]/briefing[/cyan]        actionable insights\n"
         "[cyan]/status[/cyan]          ingestion stats\n"
         "[cyan]/model[/cyan]           current model"
@@ -578,6 +643,94 @@ def _repl_show_sources(results: list[Any]) -> None:
 
     console.print(table)
     console.print()
+
+
+def _show_docs(limit: int = 30, fmt: str | None = None) -> None:
+    """Display ingested documents as a Rich table. Shared by REPL and CLI."""
+    import sqlite3
+
+    from verra.config import VERRA_HOME
+
+    core_db = VERRA_HOME / "core.db"
+    if not core_db.exists():
+        console.print("  [dim]No data indexed yet.[/dim]\n")
+        return
+
+    try:
+        conn = sqlite3.connect(str(core_db))
+        conn.row_factory = sqlite3.Row
+
+        where_clause = "WHERE d.format = ?" if fmt else ""
+        params: tuple = (fmt,) if fmt else ()
+        if fmt:
+            params = (fmt, limit)
+        else:
+            params = (limit,)
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                d.file_name,
+                d.format,
+                d.source_type,
+                d.indexed_at,
+                COUNT(c.id) AS chunk_count
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            {where_clause}
+            GROUP BY d.id
+            ORDER BY d.indexed_at DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        total_docs = conn.execute(
+            "SELECT COUNT(*) FROM documents" + (" WHERE format = ?" if fmt else ""),
+            (fmt,) if fmt else (),
+        ).fetchone()[0]
+
+        total_chunks = conn.execute(
+            "SELECT COUNT(*) FROM chunks"
+        ).fetchone()[0]
+
+        conn.close()
+    except Exception as exc:
+        console.print(f"  [red]Error reading documents:[/red] {exc}\n")
+        return
+
+    if not rows:
+        console.print("  [dim]No documents found.[/dim]\n")
+        return
+
+    console.print()
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+    table.add_column("Name")
+    table.add_column("Format", style="dim", justify="center")
+    table.add_column("Chunks", justify="right", style="dim")
+    table.add_column("Ingested", style="dim")
+
+    for row in rows:
+        ingested = (row["indexed_at"] or "")[:10]  # YYYY-MM-DD
+        table.add_row(
+            row["file_name"],
+            (row["format"] or "?").upper(),
+            str(row["chunk_count"]),
+            ingested,
+        )
+
+    console.print(table)
+
+    disk_bytes = _disk_usage(VERRA_HOME)
+    console.print(
+        f"\n  [dim]{total_docs} documents \u00b7 {total_chunks} chunks \u00b7 {_fmt_bytes(disk_bytes)}[/dim]"
+    )
+    console.print()
+
+
+def _repl_show_docs() -> None:
+    """Show ingested documents from within the REPL."""
+    _show_docs(limit=30)
 
 
 @click.group(invoke_without_command=True)
@@ -1043,6 +1196,17 @@ def info() -> None:
     """Alias for 'verra status'."""
     ctx = click.get_current_context()
     ctx.invoke(status)
+
+
+@main.command(name="docs")
+@click.option("--limit", default=30, show_default=True, help="Max documents to show.")
+@click.option("--format-filter", "fmt", default=None, help="Filter by format: pdf, txt, csv")
+def docs(limit: int, fmt: str | None) -> None:
+    """Browse ingested documents."""
+    from verra.config import ensure_data_dir
+
+    ensure_data_dir()
+    _show_docs(limit=limit, fmt=fmt)
 
 
 @main.command()
