@@ -86,7 +86,12 @@ def engine(mock_llm, mock_metadata_store, mock_vector_store, memory_store) -> Ch
 
 class TestAuthorityRanking:
     def test_authority_ranking_in_search_results(self, engine, mock_vector_store) -> None:
-        """When similarity scores are close, higher authority results should rank first."""
+        """When similarity scores are close, higher authority results should rank first.
+
+        The cross-encoder reranker is patched out here so authority ranking is
+        the deciding factor, matching the pre-reranker behavior this test was
+        originally designed for.
+        """
         # Both have similar distance (0.1 vs 0.15), so authority is the tiebreaker.
         # Composite for high_auth: 0.70*(1-0.1) + 0.25*(90/100) = 0.63+0.225 = 0.855
         # Composite for low_auth:  0.70*(1-0.15) + 0.25*(20/100) = 0.595+0.05 = 0.645
@@ -94,7 +99,11 @@ class TestAuthorityRanking:
             {"id": "1", "document": "Low authority doc.", "metadata": {"authority_weight": 20}, "distance": 0.15},
             {"id": "2", "document": "High authority doc.", "metadata": {"authority_weight": 90}, "distance": 0.1},
         ]
-        resp = engine.ask("what is the refund policy?", use_multi_hop=False)
+        # Disable the cross-encoder so authority ranking acts as the tiebreaker.
+        # Without this patch the reranker's text-based scoring may override authority
+        # for short placeholder documents that lack real semantic content.
+        with patch("verra.retrieval.search._get_reranker", return_value=None):
+            resp = engine.ask("what is the refund policy?", use_multi_hop=False)
 
         # The context passed to the LLM should reference high-authority source first
         call_args = engine.llm.complete.call_args
