@@ -236,8 +236,12 @@ def _score_case(
 
     t0 = time.monotonic()
     try:
-        response = engine.ask(question)
-        answer = response.answer
+        # Use the streaming path (retrieve + stream_with_context) which is
+        # what users actually experience and includes HyDE, query decomposition,
+        # SQL for tabular data, and the stream-specific system prompt.
+        results, _classified = engine.retrieve(question)
+        chunks = list(engine.stream_with_context(question, results))
+        answer = "".join(chunks)
     except Exception as exc:
         answer = f"[ERROR: {exc}]"
     elapsed = time.monotonic() - t0
