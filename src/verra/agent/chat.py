@@ -270,19 +270,52 @@ class ChatEngine:
         history, the query is rewritten to be self-contained before retrieval.
         The original user_message is preserved for the LLM prompt.
 
+        For multi-part questions (comparison/multi-topic signals), the query is
+        decomposed into sub-queries that are each searched independently, and the
+        results are merged and re-ranked.
+
         Includes an agentic relevance-grading step: if the first results do not
         cover the query terms well, the query is expanded/rewritten and a second
         search is issued.  Both result sets are merged and re-ranked by score.
+
+        HyDE (Hypothetical Document Embedding) is enabled automatically when
+        running semantic search — the LLM client is passed to search() so it can
+        generate a hypothetical answer whose embedding is used for vector search.
         """
         retrieval_query = self._rewrite_query(user_message)
-        classified = parse_query(retrieval_query)
-        results = search(
-            classified,
-            self.metadata_store,
-            self.vector_store,
-            n_results=self.n_results + 4,
-            entity_store=self.entity_store,
-        )
+
+        # Query decomposition: for multi-part questions, search each sub-query
+        # separately and merge results.
+        sub_queries = self._decompose_query(retrieval_query)
+
+        all_results: list[SearchResult] = []
+        seen_ids: set[str] = set()
+        classified = None
+
+        for sq in sub_queries:
+            c = parse_query(sq)
+            if classified is None:
+                classified = c
+            sub_results = search(
+                c,
+                self.metadata_store,
+                self.vector_store,
+                n_results=self.n_results + 4,
+                entity_store=self.entity_store,
+                llm_client=self.llm,
+            )
+            for r in sub_results:
+                if r.chunk_id not in seen_ids:
+                    all_results.append(r)
+                    seen_ids.add(r.chunk_id)
+
+        # classified is always set (sub_queries has at least one element)
+        assert classified is not None
+        results = all_results
+
+        # Sort merged results by score and trim
+        results.sort(key=lambda r: r.score, reverse=True)
+        results = results[: self.n_results + 4]
 
         # Grade relevance and retry with a rewritten query if coverage is poor
         is_relevant, rewritten = self._grade_relevance(user_message, results)
@@ -294,6 +327,7 @@ class ChatEngine:
                 self.vector_store,
                 n_results=self.n_results + 4,
                 entity_store=self.entity_store,
+                llm_client=self.llm,
             )
             # Merge: deduplicate by chunk_id, prefer results2 for new chunks
             seen = {r.chunk_id for r in results}
@@ -635,6 +669,43 @@ class ChatEngine:
     # Helpers
     # ------------------------------------------------------------------
 
+    _DECOMPOSE_SIGNALS: frozenset[str] = frozenset({
+        "compare", "vs", "versus", "difference between",
+        "and also", "additionally", "as well as",
+        "both", "each", "respectively",
+    })
+
+    def _decompose_query(self, user_message: str) -> list[str]:
+        """Decompose a multi-part question into sub-queries.
+
+        Returns a list of 1-3 queries. Returns [user_message] if decomposition
+        is not needed (heuristic check finds no comparison/multi-part signals).
+        """
+        lower = user_message.lower()
+        if not any(s in lower for s in self._DECOMPOSE_SIGNALS):
+            return [user_message]
+
+        try:
+            response = self.llm.complete([
+                {"role": "system", "content": (
+                    "Break down the following question into 2-3 simple sub-questions "
+                    "that can each be answered independently. Output one question per line. "
+                    "If the question is already simple, output it unchanged. "
+                    "Output ONLY the questions, nothing else."
+                )},
+                {"role": "user", "content": user_message},
+            ])
+            sub_queries = [
+                q.strip().strip("-•*123456789.)")
+                for q in response.strip().split("\n")
+                if q.strip()
+            ]
+            # Sanity: max 3, each must be a real question
+            sub_queries = [q for q in sub_queries if len(q) > 10][:3]
+            return sub_queries if sub_queries else [user_message]
+        except Exception:
+            return [user_message]
+
     def _rewrite_query(self, user_message: str) -> str:
         """Rewrite a follow-up question to be self-contained using conversation history.
 
@@ -865,6 +936,7 @@ def _format_context_with_full_docs(results: list[SearchResult]) -> str:
         file_name = r.metadata.get("file_name", "") or file_path
 
         text = r.text
+        using_full_doc = False
 
         if file_path:
             if file_name in seen_files:
@@ -875,8 +947,18 @@ def _format_context_with_full_docs(results: list[SearchResult]) -> str:
                 if p.exists() and p.stat().st_size < _FULL_DOC_SIZE_LIMIT:
                     text = p.read_text(errors="replace")
                     seen_files.add(file_name)
+                    using_full_doc = True
             except Exception:
                 pass  # Fall back to chunk text on any I/O error
+
+        # When not using a full-doc fetch, prefer the stored parent context
+        # (surrounding section) over the raw chunk fragment.  Parent text is
+        # set at ingest time by _add_parent_context() and provides ~2 KB of
+        # surrounding paragraphs without inflating the context to the whole file.
+        if not using_full_doc:
+            parent = r.metadata.get("parent_text", "")
+            if parent and len(parent) > len(text):
+                text = parent
 
         parts.append(f"[Source {source_index}: {source_label}{authority_note}]\n{text}")
         source_index += 1
