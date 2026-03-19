@@ -8,13 +8,21 @@ Chat with all your business data — emails, documents, spreadsheets. Runs local
 curl -fsSL https://raw.githubusercontent.com/ConnorBerghoffer/verra-one/main/install.sh | sh
 ```
 
-Or with pip:
+Or manually:
 
 ```bash
-pip install verra-one
+pipx install verra-one    # recommended
+pip install verra-one     # if you don't have pipx
 ```
 
 Then run `verra` — first run walks you through setup.
+
+## Update
+
+```bash
+pipx upgrade verra-one    # if installed with pipx
+pip install -U verra-one  # if installed with pip
+```
 
 ## What it does
 

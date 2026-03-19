@@ -51,7 +51,7 @@ def _check_for_updates() -> None:
                 f"  [yellow]Update available:[/yellow] {__version__} → {latest}"
             )
             console.print(
-                f"  [dim]Run: pip install --upgrade verra-one[/dim]\n"
+                f"  [dim]Run: pipx upgrade verra-one[/dim]\n"
             )
     except Exception:
         pass  # offline, PyPI down, not published yet — all fine
