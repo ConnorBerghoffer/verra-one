@@ -157,6 +157,28 @@ SET_REMINDER_TOOL: dict[str, Any] = {
     },
 }
 
+SQL_QUERY_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "query_table",
+        "description": (
+            "Run a SQL query against tabular data (CSVs). Use this for questions about "
+            "numbers, counts, comparisons, rankings, or any structured data analysis. "
+            "Available tables and their columns are listed in the context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "A SELECT SQL query. Only SELECT is allowed.",
+                }
+            },
+            "required": ["sql"],
+        },
+    },
+}
+
 CALCULATE_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -194,6 +216,7 @@ AGENTIC_TOOLS: list[dict[str, Any]] = [
     CREATE_NOTE_TOOL,
     SET_REMINDER_TOOL,
     CALCULATE_TOOL,
+    SQL_QUERY_TOOL,
 ]
 
 
@@ -309,12 +332,14 @@ class ToolHandler:
         vector_store: Any,
         memory_store: Any,
         entity_store: Any | None = None,
+        tabular_store: Any | None = None,
     ) -> None:
         self.llm = llm
         self.metadata_store = metadata_store
         self.vector_store = vector_store
         self.memory_store = memory_store
         self.entity_store = entity_store
+        self.tabular_store = tabular_store
 
         # Dispatch table — maps tool name to bound method
         self._handlers: dict[str, Any] = {
@@ -324,6 +349,7 @@ class ToolHandler:
             "create_note": self._create_note,
             "set_reminder": self._set_reminder,
             "calculate": self._calculate,
+            "query_table": self._query_table,
         }
 
     # ------------------------------------------------------------------
@@ -631,3 +657,28 @@ class ToolHandler:
             return str(result)
         except Exception as exc:
             return f"[Calculation error: {exc}. Expression: {expression!r}]"
+
+    def _query_table(self, sql: str) -> str:
+        """Execute a SELECT query against the tabular store and return a formatted result."""
+        if self.tabular_store is None:
+            return "No tabular data is available. Ingest CSV files first."
+
+        if not sql.strip().upper().startswith("SELECT"):
+            return "Error: Only SELECT queries are allowed."
+
+        try:
+            results = self.tabular_store.query(sql)
+        except Exception as exc:
+            return f"SQL error: {exc}"
+
+        if not results:
+            return "Query returned no results."
+
+        headers = list(results[0].keys())
+        lines = [", ".join(headers)]
+        for row in results[:50]:  # Cap at 50 rows to avoid huge context
+            lines.append(", ".join(str(row[h]) if row[h] is not None else "" for h in headers))
+
+        total = len(results)
+        suffix = f"\n({total} rows)" if total <= 50 else f"\n(showing first 50 of {total} rows)"
+        return "\n".join(lines) + suffix

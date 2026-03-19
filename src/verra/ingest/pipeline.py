@@ -64,6 +64,7 @@ def ingest_folder(
     vector_store: VectorStore,
     entity_store: EntityStore | None = None,
     analysis_store: AnalysisStore | None = None,
+    tabular_store: Any | None = None,
     analysis_mode: str = "realtime",  # 'fast', 'realtime', 'deep'
     force_reindex: bool = False,
     progress_callback: Callable[[Path, int, int], None] | None = None,
@@ -273,6 +274,15 @@ def ingest_folder(
                     document_type=doc_type,
                     authority_weight=authority_weight,
                 )
+
+                # Load CSV into the tabular store for SQL querying (non-fatal)
+                if tabular_store is not None and doc.format == "csv":
+                    try:
+                        raw_csv = file_path.read_text(errors="replace")
+                        tabular_store.ingest_csv(file_path.name, str(file_path), raw_csv)
+                        _emit(file_path, "tabular", f"loaded {file_path.name}")
+                    except Exception:
+                        pass  # CSV still gets chunked normally
 
                 # Patch document_id into each chunk's metadata now that we have it
                 for chunk in chunks:
