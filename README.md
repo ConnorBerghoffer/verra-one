@@ -2,6 +2,14 @@
 
 Chat with all your business data — emails, documents, spreadsheets. Runs locally with Ollama or connects to Claude/OpenAI.
 
+### Setup
+
+![Setup](assets/verra-setup.gif)
+
+### Usage
+
+![Usage](assets/verra-use.gif)
+
 ## Install
 
 ```bash
